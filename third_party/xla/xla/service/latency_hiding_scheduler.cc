@@ -42,6 +42,7 @@ limitations under the License.
 #include "xla/debug_options_flags.h"
 #include "xla/hlo/analysis/hlo_alias_analysis.h"
 #include "xla/hlo/analysis/hlo_reachability.h"
+#include "xla/hlo/ir/hlo_casting_utils.h"
 #include "xla/hlo/ir/hlo_computation.h"
 #include "xla/hlo/ir/hlo_instruction.h"
 #include "xla/hlo/ir/hlo_instructions.h"
@@ -55,11 +56,10 @@ limitations under the License.
 #include "xla/shape.h"
 #include "xla/shape_util.h"
 #include "xla/status_macros.h"
+#include "xla/tsl/platform/errors.h"
+#include "xla/tsl/platform/statusor.h"
 #include "xla/util.h"
 #include "xla/xla.pb.h"
-#include "tsl/platform/errors.h"
-#include "tsl/platform/status.h"
-#include "tsl/platform/statusor.h"
 
 namespace xla {
 namespace {
@@ -215,6 +215,7 @@ bool AsyncTracker::IsSupportedAsyncDone(const HloInstruction& hlo) const {
     }
     switch (op.inner) {
       case HloOpcode::kAllToAll:
+      case HloOpcode::kRaggedAllToAll:
       case HloOpcode::kAllGather:
       case HloOpcode::kAllReduce:
       case HloOpcode::kCollectiveBroadcast:
@@ -244,6 +245,7 @@ bool AsyncTracker::IsSupportedAsyncStart(const HloInstruction& hlo) const {
     }
     switch (op.inner) {
       case HloOpcode::kAllToAll:
+      case HloOpcode::kRaggedAllToAll:
       case HloOpcode::kAllGather:
       case HloOpcode::kAllReduce:
       case HloOpcode::kCollectiveBroadcast:
@@ -269,6 +271,8 @@ ResourcesVector AsyncTracker::GetResourcesFromInstructionImpl(
         return ResourceType::kAllGather;
       case HloOpcode::kAllToAll:
         return ResourceType::kAllToAll;
+      case HloOpcode::kRaggedAllToAll:
+        return ResourceType::kRaggedAllToAll;
       case HloOpcode::kCollectiveBroadcast:
         return ResourceType::kCollectiveBroadcast;
       case HloOpcode::kCollectivePermute:
@@ -315,10 +319,11 @@ ResourcesVector AsyncTracker::GetResourcesFromInstructionImpl(
                                ResourceUsageType::kResourceRelease)
               : std::make_pair(ResourceTypeToIndex(ResourceType::kSendRecv),
                                ResourceUsageType::kResourceRelease)};
-    case HloOpcode::kRecvDone:
+    case HloOpcode::kRecvDone: {
+      const HloSendRecvInstruction* recv =
+          DynCast<HloSendRecvInstruction>(hlo.operand(0));
       return ResourcesVector{
-          static_cast<const HloSendRecvInstruction*>(hlo.operand(0))
-                  ->is_host_transfer()
+          (recv != nullptr && recv->is_host_transfer())
               ? std::make_pair(
                     config_.force_send_recv_to_use_same_resource
                         ? ResourceTypeToIndex(ResourceType::kSendHost)
@@ -326,14 +331,17 @@ ResourcesVector AsyncTracker::GetResourcesFromInstructionImpl(
                     ResourceUsageType::kResourceOccupy)
               : std::make_pair(ResourceTypeToIndex(ResourceType::kSendRecv),
                                ResourceUsageType::kResourceOccupy)};
-    case HloOpcode::kSendDone:
+    }
+    case HloOpcode::kSendDone: {
+      const HloSendRecvInstruction* send =
+          DynCast<HloSendRecvInstruction>(hlo.operand(0));
       return ResourcesVector{
-          static_cast<const HloSendRecvInstruction*>(hlo.operand(0))
-                  ->is_host_transfer()
+          (send != nullptr && send->is_host_transfer())
               ? std::make_pair(ResourceTypeToIndex(ResourceType::kSendHost),
                                ResourceUsageType::kResourceOccupy)
               : std::make_pair(ResourceTypeToIndex(ResourceType::kSendRecv),
                                ResourceUsageType::kResourceOccupy)};
+    }
     default:
       return ResourcesVector{};
   }
@@ -381,19 +389,17 @@ AsyncTracker::RecursivelyComputeResourceMap(
 
 int64_t AsyncTracker::GetNumResourcesPerInstruction(
     int64_t resource_type, const HloInstruction& instr) const {
-  // For instructions not calling a computation then return 1 if the instruction
-  // has opcode equal to 'async_done'
+  // For instructions not calling a computation, or async start/done
+  // instructions, we directly check the resources from the instruction.
   if (instr.called_computations().empty() ||
       instr.opcode() == HloOpcode::kAsyncStart ||
       instr.opcode() == HloOpcode::kAsyncDone) {
-    return absl::c_any_of(GetResourcesFromInstruction(instr),
-                          [resource_type](const ResourcePair& resource) {
-                            return resource.second ==
-                                       ResourceUsageType::kResourceOccupy &&
-                                   (resource_type == resource.first);
-                          })
-               ? 1
-               : 0;
+    return absl::c_count_if(GetResourcesFromInstruction(instr),
+                            [resource_type](const ResourcePair& resource) {
+                              return resource.second ==
+                                         ResourceUsageType::kResourceOccupy &&
+                                     (resource_type == resource.first);
+                            });
   }
   int64_t num_resources = 0;
   for (const HloComputation* computation : instr.called_computations()) {
@@ -419,6 +425,8 @@ void AsyncTracker::SetConcurrentResourceLimits(
       config_.copy_overlap_limit;
   max_concurrent_resource[ResourceTypeToIndex(ResourceType::kAllToAll)] =
       config_.all_to_all_overlap_limit;
+  max_concurrent_resource[ResourceTypeToIndex(ResourceType::kRaggedAllToAll)] =
+      config_.ragged_all_to_all_overlap_limit;
   max_concurrent_resource[ResourceTypeToIndex(ResourceType::kAllGather)] =
       config_.all_gather_overlap_limit;
   max_concurrent_resource[ResourceTypeToIndex(ResourceType::kAllReduce)] =
@@ -431,12 +439,18 @@ void AsyncTracker::SetConcurrentResourceLimits(
       config_.send_recv_host_overlap_limit;
   max_concurrent_resource[ResourceTypeToIndex(ResourceType::kRecvHost)] =
       config_.send_recv_host_overlap_limit;
-  // Set the limits for target-defined resources
-  const int64_t first_target_resource =
-      AsyncTracker::GetFirstTargetDefinedResource();
-  for (int64_t i = 0; i < GetNumTargetDefinedResources(); ++i) {
-    max_concurrent_resource[first_target_resource + i] =
-        GetNumAvailableResources(first_target_resource + i);
+  // Set the limits for target-defined resources.
+  for (int64_t resource_type = GetTargetDefinedResourceTypeBegin();
+       resource_type <
+       GetTargetDefinedResourceTypeBegin() + GetNumTargetDefinedResources();
+       ++resource_type) {
+    CHECK_GT(GetNumAvailableResources(resource_type), 0)
+        << "Target-defined resource with id " << resource_type
+        << " has a concurrency limit of 0. Please set it to a positive value "
+           "by making sure GetNumTargetDefinedResources returns the correct "
+           "limit.";
+    max_concurrent_resource[resource_type] =
+        GetNumAvailableResources(resource_type);
   }
 }
 
@@ -446,6 +460,8 @@ absl::string_view AsyncTracker::GetResourceName(int64_t resource_type) const {
       return "kNoResource";
     case ResourceTypeToIndex(ResourceType::kAllToAll):
       return "kAllToAll";
+    case ResourceTypeToIndex(ResourceType::kRaggedAllToAll):
+      return "kRaggedAllToAll";
     case ResourceTypeToIndex(ResourceType::kAllGather):
       return "kAllGather";
     case ResourceTypeToIndex(ResourceType::kAllReduce):
@@ -476,6 +492,9 @@ absl::string_view AsyncTracker::GetResourceUsageName(
 
 ResourceHazardType AsyncTracker::GetResourceHazardType(
     int64_t resource_type) const {
+  if (resource_type == ResourceTypeToIndex(ResourceType::kCopy)) {
+    return ResourceHazardType::kShareable;
+  }
   return ResourceHazardType::kUnshareable;
 }
 
@@ -1138,6 +1157,8 @@ class ReadySetLt {
   const DefaultSchedulerCore::SchedulingState& sched_state_;
   DefaultSchedulerCore::TargetSchedulingRule target_scheduling_rule_;
   DefaultSchedulerCore::TargetSchedulingRule early_target_scheduling_rule_;
+  DefaultSchedulerCore::OverlapLimitRule
+      scheduling_instruction_crosses_overlap_limit_;
 
   int ReadyIfScheduled(const HloGraphNode& gn) const {
     int ready_nodes_if_scheduled = 0;
@@ -1271,9 +1292,9 @@ class ReadySetLt {
             cand.node->GetResources());
     int64_t num_conflicting_resources = 0;
     for (int64_t resource : resources) {
-      if (!sched_state_.resources_in_flight.contains(resource)) continue;
+      if (!sched_state_.resource_occupiers_in_flight.count(resource)) continue;
       num_conflicting_resources +=
-          sched_state_.resources_in_flight.at(resource);
+          sched_state_.resource_occupiers_in_flight.at(resource).size();
     }
     return num_conflicting_resources;
   }
@@ -1312,26 +1333,6 @@ DefaultSchedulerCore::FindAndExtractBestNodeAvailable(
   }
   absl::InlinedVector<std::pair<HloGraphNode*, SkipNodeReason>, 2>
       skipped_nodes_and_reasons;
-  auto scheduling_instruction_crosses_overlap_limit =
-      [&sched_state](const HloInstruction& instr) {
-        for (const auto& [resource, limit] :
-             sched_state.max_concurrent_resource) {
-          // No resources in flight of this kind. Continue.
-          auto it = sched_state.resources_in_flight.find(resource);
-          if (it == sched_state.resources_in_flight.end() || it->second == 0) {
-            continue;
-          }
-          // Number of instances of 'resource' needed if this instruction was to
-          // be scheduled.
-          const int64_t num_resources_needed =
-              sched_state.async_tracker->GetNumResourcesPerInstruction(resource,
-                                                                       instr);
-          if (limit < num_resources_needed) {
-            return true;
-          }
-        }
-        return false;
-      };
   VLOG(2) << "Current time: " << sched_state.current_time;
   ReadySetLt ready_lt{&sched_state, target_scheduling_rule_,
                       early_target_scheduling_rule_};
@@ -1363,8 +1364,8 @@ DefaultSchedulerCore::FindAndExtractBestNodeAvailable(
     }
     // If this node would cause the max_concurrent_resource count to go beyond
     // the limit do not schedule it and pass to the next node.
-    if (scheduling_instruction_crosses_overlap_limit(
-            (*ready_node_it)->GetInstr())) {
+    if (scheduling_instruction_crosses_overlap_limit_(sched_state,
+                                                      *ready_node_it)) {
       if (ready_chosen.node == nullptr) {
         skipped_nodes_and_reasons.push_back(
             {*ready_node_it, SkipNodeReason::kExceedsOverlapLimit});
@@ -1412,6 +1413,24 @@ DefaultSchedulerCore::FindAndExtractBestNodeAvailable(
     }
   }
   if (ready_chosen.node == nullptr) {
+    if (!sched_state.ready_annotations.empty()) {
+      std::string error_message = absl::StrCat(
+          "There is a scheduling group which exceeds the overlap limits. "
+          "Annotation id: ",
+          sched_state.ready_annotations.front(), ". ");
+      absl::flat_hash_map<int64_t, int64_t> num_resources_needed =
+          GetNumResourcesNeededForAnnotation(
+              sched_state, sched_state.ready_annotations.front());
+      for (const auto& [resource, num_needed] : num_resources_needed) {
+        int64_t limit = sched_state.max_concurrent_resource.at(resource);
+        if (num_needed > limit) {
+          absl::StrAppend(&error_message, "It needs ", num_needed, " ",
+                          sched_state.async_tracker->GetResourceName(resource),
+                          " resources, but the limit is ", limit, ". ");
+        }
+      }
+      return absl::InternalError(error_message);
+    }
     return absl::InternalError(absl::StrCat(
         "FindAndExtractBestNodeAvailable failed to find a node to "
         "schedule, skipped nodes: ",
@@ -1539,6 +1558,21 @@ bool DefaultSchedulerCore::AddOccupierToResource(
   for (; it != occupiers.end(); it++) {
     it->second += accumulated_delay;
   }
+
+  // Update the ready time of the occupiers.
+  for (auto it = occupiers.begin(); it != occupiers.end(); it++) {
+    HloGraphNode* done_node = it->first->TargetPtr();
+    if (done_node == nullptr) {
+      continue;
+    }
+    if (done_node->GetReadyTime() < it->second) {
+      for (HloEdge& start_edge : done_node->GetPredecessors()) {
+        if (start_edge.Target().GetReadyTime() < it->second) {
+          start_edge.Target().SetReadyTime(it->second);
+        }
+      }
+    }
+  }
   return true;
 }
 
@@ -1570,12 +1604,13 @@ class AnnotationReadySetLt {
   }
 };
 absl::StatusOr<HloGraphNode*> FindAndExtractBestAnnotatedNode(
-    DefaultSchedulerCore::ReadyQueueSet& annotation_ready) {
+    DefaultSchedulerCore::SchedulingState& sched_state) {
   using ScheduleCandidate = DefaultSchedulerCore::ScheduleCandidate;
   using CandidateResult = DefaultSchedulerCore::CandidateResult;
   AnnotationReadySetLt ready_lt;
   // Construct a schedule candidate for caching.
   ScheduleCandidate ready_chosen;
+  auto& annotation_ready = sched_state.annotation_ready;
   auto chosen_it = annotation_ready.end();
   // Try to pick nodes from the ready set first as are the ones that cause the
   // most latency hiding.
@@ -1629,17 +1664,18 @@ absl::StatusOr<HloGraphNode*> FindAndExtractBestAnnotatedNode(
 }
 
 absl::Status DefaultSchedulerCore::ScheduleAnnotation(
-    int64_t annotation,
+    const HloComputation* computation, int64_t annotation,
     DefaultSchedulerCore::SchedulingState* sched_state) const {
-  // Create the ready set with the roots of the annotation
+  // Filter the ready nodes with the annotation.
   TF_RET_CHECK(sched_state->annotation_ready.empty());
-  for (const HloInstruction* instr :
-       annotation_tracker_->GetRootInstructions(annotation)) {
-    sched_state->annotation_ready.push_back(
-        &sched_state->sched_graph.GetNode(instr));
+  for (HloGraphNode* node : sched_state->ready_set) {
+    if (node->GetAnnotation() == annotation) {
+      sched_state->annotation_ready.push_back(node);
+    }
   }
   int64_t num_scheduled = 0;
-  int64_t annotation_size = annotation_tracker_->GetNumInstructions(annotation);
+  int64_t annotation_size =
+      annotation_tracker_->GetNumInstructions(computation, annotation);
   while (!sched_state->annotation_ready.empty()) {
     // Print the current annotation ready queue.
     VLOG(2) << "Current annotation ready queue:";
@@ -1654,9 +1690,8 @@ absl::Status DefaultSchedulerCore::ScheduleAnnotation(
     }());
     VLOG(2) << "Current time: " << sched_state->current_time;
     // Find the best annotated node to schedule.
-    TF_ASSIGN_OR_RETURN(
-        HloGraphNode * node,
-        FindAndExtractBestAnnotatedNode(sched_state->annotation_ready));
+    TF_ASSIGN_OR_RETURN(HloGraphNode * node,
+                        FindAndExtractBestAnnotatedNode(*sched_state));
 
     TF_RET_CHECK(node != nullptr)
         << "Couldn't find an annotated node to schedule.";
@@ -1681,6 +1716,23 @@ absl::Status DefaultSchedulerCore::ScheduleAnnotation(
       << "Couldn't schedule all annotated nodes in one go.";
   return absl::OkStatus();
 }
+
+// Returns the vector of annotations that the given node is a successor of, but
+// is not included in that annotation group itself.
+std::vector<int64_t> GetPredecessorAnnotations(const HloGraphNode* node) {
+  int64_t cur_annotation = node->GetAnnotation();
+  std::vector<int64_t> predecessor_annotations;
+  absl::flat_hash_set<int64_t> seen_annotations;
+  for (const HloEdge& edge : node->GetPredecessors()) {
+    int64_t pred_annotation = edge.Target().GetAnnotation();
+    if (pred_annotation != cur_annotation &&
+        seen_annotations.insert(pred_annotation).second) {
+      predecessor_annotations.push_back(pred_annotation);
+    }
+  }
+  return predecessor_annotations;
+}
+
 absl::StatusOr<HloGraphNode::TimeCost> DefaultSchedulerCore::ScheduleNode(
     HloGraphNode* n, DefaultSchedulerCore::SchedulingState* sched_state) const {
   // Insert the node into the sequence and mark it as scheduled.
@@ -1688,6 +1740,30 @@ absl::StatusOr<HloGraphNode::TimeCost> DefaultSchedulerCore::ScheduleNode(
       const_cast<HloInstruction*>(&n->GetInstr()));
   n->SetScheduled();
 
+  // If this node was a successor to one or more scheduling groups, update the
+  // number of scheduled successors for each of those groups and add the group
+  // the ready_annotations set if all of its successors have been scheduled.
+  std::vector<int64_t> annotations = GetPredecessorAnnotations(n);
+  if (!annotations.empty()) {
+    VLOG(2) << "Scheduled node is a frontier: " << n->GetInstr().name();
+    for (int64_t annotation : annotations) {
+      sched_state->num_scheduled_successors_for_annotation[annotation]++;
+      VLOG(2)
+          << "Annotation: " << annotation << " scheduled num successors: "
+          << sched_state->num_scheduled_successors_for_annotation[annotation]
+          << " total num successors: "
+          << annotation_tracker_->GetNumSuccessors(n->GetInstr().parent(),
+                                                   annotation);
+      // LegalizeSchedulingAnnotations pass should have made sure that we will
+      // eventually reach a state where all successors of the annotation are
+      // scheduled.
+      if (annotation_tracker_->GetNumSuccessors(n->GetInstr().parent(),
+                                                annotation) ==
+          sched_state->num_scheduled_successors_for_annotation[annotation]) {
+        sched_state->ready_annotations.push_back(annotation);
+      }
+    }
+  }
   // Remove scheduled node from selective_resources_releasers if it
   // was there.
   if (sched_state->config.enable_selective_resources &&
@@ -1781,6 +1857,10 @@ absl::StatusOr<HloGraphNode::TimeCost> DefaultSchedulerCore::ScheduleNode(
           auto occupied_resources =
               edge.Target().GetShareableResourcesOnEdge(inverse_edge);
           for (const int64_t resource : occupied_resources) {
+            VLOG(3) << "Adding edge from" << edge.Target().GetInstr().name()
+                    << " to " << inverse_edge.Target().GetInstr().name()
+                    << " for resource"
+                    << sched_state->async_tracker->GetResourceName(resource);
             CHECK(AddOccupierToResource(
                 current_time, inverse_edge,
                 sched_state->shareable_resource_occupiers[resource]));
@@ -1860,31 +1940,16 @@ absl::StatusOr<HloGraphNode::TimeCost> DefaultSchedulerCore::ScheduleNode(
       }
     }
     edge.Target().SetReadyTime(ready_time);
+    int64_t annotation = edge.Target().GetAnnotation();
     // We are adding the no-op instructions to a separate set so that we can
     // immediately schedule them when they are ready.
-    if (IsNopInstruction(edge.Target().GetInstr())) {
+    if (IsNopInstruction(edge.Target().GetInstr()) && annotation == -1) {
       sched_state->nop_set.push_back(&edge.Target());
       continue;
     }
     sched_state->ready_set.push_back(&edge.Target());
-    int64_t annotation = edge.Target().GetAnnotation();
-    if (annotation != -1) {
-      sched_state->ready_num_nodes_with_annotation[annotation]++;
-      VLOG(2) << "Annotation: " << annotation
-              << " ready_num_nodes_with_annotation: "
-              << sched_state->ready_num_nodes_with_annotation[annotation]
-              << " num_root_instructions: "
-              << annotation_tracker_->GetNumRootInstructions(annotation);
-      // LegalizeSchedulingAnnotations pass should have made sure that we will
-      // eventually reach a state where all of the annotation root instructions
-      // will be ready at the same time.
-      if (annotation_tracker_->GetNumRootInstructions(annotation) ==
-          sched_state->ready_num_nodes_with_annotation[annotation]) {
-        sched_state->ready_annotations.push_back(annotation);
-      }
-      if (annotation == sched_state->ongoing_annotation) {
-        sched_state->annotation_ready.push_back(&edge.Target());
-      }
+    if (annotation != -1 && annotation == sched_state->ongoing_annotation) {
+      sched_state->annotation_ready.push_back(&edge.Target());
     }
     if (edge.Target().GetReadyTime() > current_time) {
       sched_state->next_ready_stack.push_back(&edge.Target());
@@ -1902,9 +1967,24 @@ absl::StatusOr<HloGraphNode::TimeCost> DefaultSchedulerCore::ScheduleNode(
   ++sched_state->scheduled_count;
   for (auto& resource : n->GetResources()) {
     if (resource.second == ResourceUsageType::kResourceRelease) {
-      --sched_state->resources_in_flight[resource.first];
+      // Some recv-dones exist without a corresponding recv op in the same
+      // computation. In this case, we cannot find the corresponding start op
+      // and thus cannot erase the start op from the map.
+      if (sched_state->resource_occupiers_in_flight.contains(resource.first)) {
+        sched_state->resource_occupiers_in_flight.at(resource.first)
+            .erase(&n->GetInstr());
+      }
     } else if (resource.second == ResourceUsageType::kResourceOccupy) {
-      ++sched_state->resources_in_flight[resource.first];
+      // For supported async collective done ops, save their corresponding start
+      // ops in the map
+      if (async_tracker_->IsSupportedAsyncDone(n->GetInstr()) &&
+          async_tracker_->IsSupportedAsyncStart(*n->GetInstr().operand(0))) {
+        sched_state->resource_occupiers_in_flight[resource.first].insert(
+            n->GetInstr().operand(0));
+      } else {
+        sched_state->resource_occupiers_in_flight[resource.first].insert(
+            &n->GetInstr());
+      }
     }
   }
   VLOG(10) << "Memory pressure before schedule: "
@@ -2241,7 +2321,7 @@ void HloScheduleGraph::AnnotateGraph(
   const HloComputation* comp = original_order_[0]->parent();
   for (int64_t annotation : annotation_tracker->GetAnnotations(comp)) {
     for (const HloInstruction* instr :
-         annotation_tracker->GetInstructions(annotation)) {
+         annotation_tracker->GetInstructions(comp, annotation)) {
       HloGraphNode& node = GetNode(instr);
       TF_CHECK_OK(node.SetAnnotation(annotation));
     }
@@ -2258,6 +2338,29 @@ absl::Status DefaultSchedulerCore::InitializeScheduler(
   annotation_tracker_ = std::make_unique<AnnotationTracker>(module);
   if (VLOG_IS_ON(2)) {
     annotation_tracker_->PrintAnnotationSets(2);
+  }
+  if (!scheduling_instruction_crosses_overlap_limit_) {
+    scheduling_instruction_crosses_overlap_limit_ =
+        [](const SchedulingState& sched_state, const HloGraphNode* node) {
+          for (const auto& [resource, limit] :
+               sched_state.max_concurrent_resource) {
+            // No resources in flight of this kind. Continue.
+            auto it = sched_state.resource_occupiers_in_flight.find(resource);
+            if (it == sched_state.resource_occupiers_in_flight.end() ||
+                it->second.empty()) {
+              continue;
+            }
+            // Number of instances of 'resource' needed if this instruction was
+            // to be scheduled.
+            const int64_t num_resources_needed =
+                sched_state.async_tracker->GetNumResourcesPerInstruction(
+                    resource, node->GetInstr());
+            if (limit < num_resources_needed) {
+              return true;
+            }
+          }
+          return false;
+        };
   }
   return absl::OkStatus();
 }
@@ -2277,6 +2380,37 @@ absl::Status DefaultSchedulerCore::SchedulingStep(
   return absl::OkStatus();
 }
 
+absl::flat_hash_map<int64_t, int64_t>
+DefaultSchedulerCore::GetNumResourcesNeededForAnnotation(
+    const SchedulingState& sched_state, int64_t annotation) {
+  absl::flat_hash_map<int64_t, int64_t> num_resources_needed;
+  const HloComputation* comp =
+      sched_state.sched_graph.GetOriginalInstrList()[0]->parent();
+  for (const HloInstruction* instr :
+       annotation_tracker_->GetInstructions(comp, annotation)) {
+    absl::Span<const ResourcePair> rv =
+        sched_state.async_tracker->GetResourcesFromInstruction(*instr);
+    for (const auto& [resource, usage] : rv) {
+      if (usage == ResourceUsageType::kResourceOccupy) {
+        num_resources_needed[resource]++;
+      }
+    }
+  }
+  return num_resources_needed;
+}
+
+bool DefaultSchedulerCore::SchedulingAnnotationCrossesOverlapLimit(
+    const SchedulingState& sched_state, int64_t annotation) {
+  absl::flat_hash_map<int64_t, int64_t> num_resources_needed =
+      GetNumResourcesNeededForAnnotation(sched_state, annotation);
+  for (const auto& [resource, num_needed] : num_resources_needed) {
+    int64_t limit = sched_state.max_concurrent_resource.at(resource);
+    if (num_needed > limit) {
+      return true;
+    }
+  }
+  return false;
+}
 absl::StatusOr<std::vector<HloInstruction*>>
 DefaultSchedulerCore::ScheduleComputation(const HloComputation* computation) {
   const HloSchedule& module_schedule = computation->parent()->schedule();
@@ -2295,6 +2429,14 @@ DefaultSchedulerCore::ScheduleComputation(const HloComputation* computation) {
                                            latency_estimator_);
   if (annotation_tracker_->HasAnnotations(computation)) {
     sched_state.sched_graph.AnnotateGraph(annotation_tracker_.get());
+    for (int64_t annotation :
+         annotation_tracker_->GetAnnotations(computation)) {
+      if (annotation_tracker_->GetSuccessors(computation, annotation).empty()) {
+        VLOG(3) << "Annotation " << annotation
+                << " does not have any successors, is ready to be scheduled";
+        sched_state.ready_annotations.push_back(annotation);
+      }
+    }
   }
   sched_state.sched_graph.InitializeGraphAnalysis(async_tracker_);
   VLOG(5) << "Just built graph:";
@@ -2328,17 +2470,31 @@ DefaultSchedulerCore::ScheduleComputation(const HloComputation* computation) {
       return absl::StrJoin(sched_state.ready_set, "\n", LogFormatter());
     }());
     if (!sched_state.ready_annotations.empty()) {
-      // TODO (sacer): If more than one annotations are ready, decide the order
-      // with a heuristic.
-      for (int64_t annotation : sched_state.ready_annotations) {
+      // Pick the first ready annotation whose scheduling will not cross the
+      // overlap limit. If there is no such annotation, continue with scheduling
+      // non-annotated ops.
+      int64_t annotation_index = -1;
+      for (int64_t i = 0; i < sched_state.ready_annotations.size(); ++i) {
+        if (SchedulingAnnotationCrossesOverlapLimit(
+                sched_state, sched_state.ready_annotations[i])) {
+          continue;
+        }
+        annotation_index = i;
+        break;
+      }
+      if (annotation_index != -1) {
+        std::swap(sched_state.ready_annotations[annotation_index],
+                  sched_state.ready_annotations.back());
+        int64_t annotation = sched_state.ready_annotations.back();
+        sched_state.ready_annotations.pop_back();
         VLOG(2) << "------- BEGIN ANNOTATION: " << annotation << " -------";
         sched_state.ongoing_annotation = annotation;
-        TF_RETURN_IF_ERROR(ScheduleAnnotation(annotation, &sched_state));
+        TF_RETURN_IF_ERROR(
+            ScheduleAnnotation(computation, annotation, &sched_state));
         VLOG(2) << "-------  END ANNOTATION: " << annotation << " --------";
         sched_state.ongoing_annotation = -1;
+        continue;
       }
-      sched_state.ready_annotations.clear();
-      continue;
     }
     TF_RETURN_IF_ERROR(SchedulingStep(&sched_state));
   }
@@ -2425,6 +2581,7 @@ LatencyHidingScheduler::LatencyHidingStatistics(
     kAllReduce,
     kCollectivePermute,
     kAllToAll,
+    kRaggedAllToAll,
     kReduceScatter,
     kSend,
     kRecv,
@@ -2442,6 +2599,8 @@ LatencyHidingScheduler::LatencyHidingStatistics(
         return AsyncKind::kCollectivePermute;
       case HloOpcode::kAllToAll:
         return AsyncKind::kAllToAll;
+      case HloOpcode::kRaggedAllToAll:
+        return AsyncKind::kRaggedAllToAll;
       case HloOpcode::kReduceScatter:
         return AsyncKind::kReduceScatter;
       case HloOpcode::kSend:
@@ -2540,6 +2699,8 @@ LatencyHidingScheduler::LatencyHidingStatistics(
       wasted_time_per_collective[AsyncKind::kCollectivePermute],
       /*all_to_all_wasted_cycles=*/
       wasted_time_per_collective[AsyncKind::kAllToAll],
+      /*ragged_all_to_all_wasted_cycles=*/
+      wasted_time_per_collective[AsyncKind::kRaggedAllToAll],
       /*reduce_scatter_wasted_cycles=*/
       wasted_time_per_collective[AsyncKind::kReduceScatter],
       /*send_wasted_cycles=*/wasted_time_per_collective[AsyncKind::kSend],
@@ -2566,6 +2727,7 @@ std::string LatencyHidingScheduler::SchedulerStatisticsString(
                       sched_stats.collective_broadcast_wasted_cycles +
                       sched_stats.collective_permute_wasted_cycles +
                       sched_stats.all_to_all_wasted_cycles +
+                      sched_stats.ragged_all_to_all_wasted_cycles +
                       sched_stats.reduce_scatter_wasted_cycles +
                       sched_stats.send_wasted_cycles +
                       sched_stats.recv_wasted_cycles,
@@ -2580,6 +2742,8 @@ std::string LatencyHidingScheduler::SchedulerStatisticsString(
                   sched_stats.collective_permute_wasted_cycles, "\n");
   absl::StrAppend(&result, "Wasted cycles for all-to-all: ",
                   sched_stats.all_to_all_wasted_cycles, "\n");
+  absl::StrAppend(&result, "Wasted cycles for ragged-all-to-all: ",
+                  sched_stats.ragged_all_to_all_wasted_cycles, "\n");
   absl::StrAppend(&result, "Wasted cycles for reduce-scatter: ",
                   sched_stats.reduce_scatter_wasted_cycles, "\n");
   absl::StrAppend(&result,
@@ -2609,6 +2773,8 @@ absl::StatusOr<bool> LatencyHidingScheduler::Run(
   // Currently we expect that a schedule that minimizes memory pressure is
   // provided as a base. It's not necessary for the algorithm itself but it
   // allows us to not having to think for now about memory pressure.
+  CHECK(module->has_schedule()) << "LatencyHidingScheduler expects a base "
+                                   "schedule that minimizes memory pressure.";
   std::vector<HloComputation*> computations_to_schedule;
   computations_to_schedule.reserve(module->computation_count());
   // Collect which computations have latency hiding opportunities.

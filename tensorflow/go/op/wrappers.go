@@ -20737,7 +20737,7 @@ func IdentityReaderV2(scope *Scope, optional ...IdentityReaderV2Attr) (reader_ha
 //
 // where
 //
-// \\(gamma(a, x) = \\int_{0}^{x} t^{a-1} exp(-t) dt\\)
+// \\(gamma(a, x) = \int_{0}^{x} t^{a-1} exp(-t) dt\\)
 //
 // is the lower incomplete Gamma function.
 //
@@ -52101,6 +52101,28 @@ func TPUCopyWithDynamicShape(scope *Scope, tensors []tf.Output, unpadded_sizes [
 		return
 	}
 	return tpu_tensors
+}
+
+// Generates a zero-valued tensor for use as a dummy input to a TPU.
+//
+// For the internal use of the TF2XLA bridge in the XLA Broadcast pass. This op
+//
+// Arguments:
+//
+//	dtype: The element type of the produced tensor.
+//	shape: The shape of the produced tensor.
+func TPUDummyInput(scope *Scope, dtype tf.DataType, shape tf.Shape) (output tf.Output) {
+	if scope.Err() != nil {
+		return
+	}
+	attrs := map[string]interface{}{"dtype": dtype, "shape": shape}
+	opspec := tf.OpSpec{
+		Type: "TPUDummyInput",
+
+		Attrs: attrs,
+	}
+	op := scope.AddOperation(opspec)
+	return op.Output(0)
 }
 
 // An op enabling differentiation of TPU Embeddings.

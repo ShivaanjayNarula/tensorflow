@@ -1,6 +1,7 @@
 load("@local_xla//xla/tsl:tsl.default.bzl", "tsl_pybind_extension")
 load("//tensorflow:pytype.default.bzl", "pytype_strict_library")
 load("//tensorflow:strict.default.bzl", "py_strict_test")
+load("//tensorflow:tensorflow.default.bzl", "get_compatible_with_portable")
 
 package(
     # copybara:uncomment default_applicable_licenses = ["//tensorflow:license"],
@@ -32,18 +33,13 @@ tsl_pybind_extension(
         "-frtti",
     ],
     features = ["-use_header_modules"],
-    visibility = [
-        ":friends",
-        "//tensorflow/python:__pkg__",
-        "//tensorflow/tools/pip_package:__subpackages__",
-    ],
     deps = [
         "//third_party/python_runtime:headers",
         "@llvm-project//llvm:Support",
         "@llvm-project//mlir:CAPIIR",
         "@llvm-project//mlir:IR",
         "@llvm-project//mlir:MLIRBindingsPythonHeadersAndDeps",
-        "@pybind11",
+        "@nanobind",
         "@stablehlo//:stablehlo_capi",
     ],
 )
@@ -51,7 +47,6 @@ tsl_pybind_extension(
 pytype_strict_library(
     name = "stablehlo",
     srcs = ["stablehlo.py"],
-    srcs_version = "PY3",
     visibility = ["//visibility:public"],
     deps = [
         ":stablehlo_extension",
@@ -61,9 +56,34 @@ pytype_strict_library(
 py_strict_test(
     name = "stablehlo_test",
     srcs = ["stablehlo_test.py"],
-    python_version = "PY3",
     deps = [
         ":stablehlo",
         #internal proto upb dep
     ],
+)
+
+cc_library(
+    name = "fold_broadcast_pass",
+    srcs = [
+        "transforms/fold_broadcast_pass.cc",
+    ],
+    hdrs = [
+        "transforms/stablehlo_passes.h",
+    ],
+    compatible_with = get_compatible_with_portable(),
+    copts = [
+        "-Ithird_party",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        "@llvm-project//llvm:Support",
+        "@llvm-project//mlir:FuncDialect",
+        "@llvm-project//mlir:IR",
+        "@llvm-project//mlir:Pass",
+        "@llvm-project//mlir:Support",
+        "@llvm-project//mlir:TransformUtils",
+        "@llvm-project//mlir:Transforms",
+        "@local_xla//xla/mlir_hlo",
+    ],
+    alwayslink = 1,
 )

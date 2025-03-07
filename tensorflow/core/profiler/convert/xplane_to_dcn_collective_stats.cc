@@ -19,16 +19,16 @@ limitations under the License.
 #include <string>
 #include <utility>
 
+#include "absl/status/statusor.h"
 #include "absl/strings/match.h"
-#include "tensorflow/core/platform/statusor.h"
+#include "xla/tsl/platform/errors.h"
+#include "xla/tsl/platform/statusor.h"
 #include "tensorflow/core/profiler/convert/dcn_slack_analysis_combiner.h"
 #include "tensorflow/core/profiler/convert/repository.h"
 #include "tensorflow/core/profiler/convert/xspace_to_dcn_slack_analysis.h"
 #include "tensorflow/core/profiler/protobuf/dcn_slack_analysis.pb.h"
 #include "tensorflow/core/profiler/utils/xplane_schema.h"
 #include "tensorflow/core/profiler/utils/xplane_utils.h"
-#include "tsl/platform/errors.h"
-#include "tsl/platform/statusor.h"
 #include "tsl/profiler/protobuf/xplane.pb.h"
 
 namespace tensorflow {

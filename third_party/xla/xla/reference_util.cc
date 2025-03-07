@@ -17,7 +17,7 @@ limitations under the License.
 
 #include <array>
 #include <cmath>
-#include <functional>
+#include <cstdint>
 #include <memory>
 #include <optional>
 #include <utility>
@@ -25,6 +25,7 @@ limitations under the License.
 
 #include "absl/container/flat_hash_set.h"
 #include "absl/functional/function_ref.h"
+#include "absl/log/check.h"
 #include "absl/types/span.h"
 #include "xla/array2d.h"
 #include "xla/array3d.h"
@@ -39,9 +40,9 @@ limitations under the License.
 #include "xla/service/shape_inference.h"
 #include "xla/shape.h"
 #include "xla/tsl/lib/math/math_util.h"
+#include "xla/tsl/platform/logging.h"
 #include "xla/window_util.h"
 #include "xla/xla_data.pb.h"
-#include "tsl/platform/logging.h"
 
 namespace xla {
 

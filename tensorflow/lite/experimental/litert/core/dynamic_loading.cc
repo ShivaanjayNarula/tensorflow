@@ -15,97 +15,89 @@
 #include "tensorflow/lite/experimental/litert/core/dynamic_loading.h"
 
 #include <dlfcn.h>
+#include <unistd.h>
 
+// clang-format off
 #ifndef __ANDROID__
-#include <glob.h>
 #if __has_include(<link.h>)
 #include <link.h>
 #endif
 #endif
+// clang-format on
 
-#include <cstddef>
+#include <filesystem>  // NOLINT
 #include <string>
 #include <vector>
 
-#include "absl/strings/str_format.h"
+#include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
 #include "tensorflow/lite/experimental/litert/c/litert_common.h"
 #include "tensorflow/lite/experimental/litert/c/litert_logging.h"
-#include "tensorflow/lite/experimental/litert/cc/litert_macros.h"
+#include "tensorflow/lite/experimental/litert/core/filesystem.h"
 
 namespace litert::internal {
 
-LiteRtStatus OpenLib(absl::string_view so_path, void** lib_handle) {
-#ifdef RTLD_DEEPBIND
-  void* res = ::dlopen(so_path.data(), RTLD_NOW | RTLD_LOCAL | RTLD_DEEPBIND);
-#else
-  void* res = ::dlopen(so_path.data(), RTLD_NOW | RTLD_LOCAL);
-#endif
+static constexpr absl::string_view kSo = ".so";
 
-  if (res == nullptr) {
-    LITERT_LOG(LITERT_ERROR, "Failed to load .so at path: %s\n",
-               so_path.data());
-    LogDlError();
-
-    return kLiteRtStatusErrorDynamicLoading;
+LiteRtStatus FindLiteRtSharedLibsHelper(const std::string& search_path,
+                                        const std::string& lib_pattern,
+                                        bool full_match,
+                                        std::vector<std::string>& results) {
+  if (!Exists(search_path)) {
+    return kLiteRtStatusErrorInvalidArgument;
   }
-  *lib_handle = res;
+
+  // TODO implement path glob in core/filesystem.h and remove filesystem
+  // include from this file.
+  for (const auto& entry : std::filesystem::directory_iterator(
+           search_path,
+           std::filesystem::directory_options::skip_permission_denied)) {
+    const auto& path = entry.path();
+    if (access(path.c_str(), R_OK) != 0) {
+      continue;
+    }
+    if (entry.is_regular_file()) {
+      if (full_match) {
+        if (path.string().find(lib_pattern) != -1) {
+          LITERT_LOG(LITERT_VERBOSE, "Found shared library: %s", path.c_str());
+          results.push_back(path);
+        }
+      } else {
+        const auto stem = path.stem().string();
+        const auto ext = path.extension().string();
+        if (stem.find(lib_pattern) == 0 && kSo == ext) {
+          LITERT_LOG(LITERT_VERBOSE, "Found shared library: %s", path.c_str());
+          results.push_back(path);
+        }
+      }
+    } else if (entry.is_directory()) {
+      FindLiteRtSharedLibsHelper(path, lib_pattern, full_match, results);
+    }
+  }
+
   return kLiteRtStatusOk;
 }
 
-LiteRtStatus CloseLib(void* lib_handle) {
-  if (0 != ::dlclose(lib_handle)) {
-    LITERT_LOG(LITERT_ERROR, "Failed to close .so with error: %s", ::dlerror());
-    return kLiteRtStatusErrorDynamicLoading;
-  }
-  return kLiteRtStatusOk;
+static const char kCompilerPluginLibPatternFmt[] = "CompilerPlugin";
+
+LiteRtStatus FindLiteRtCompilerPluginSharedLibs(
+    absl::string_view search_path, std::vector<std::string>& results) {
+  std::string root(search_path);
+  const std::string lib_pattern =
+      absl::StrCat(kLiteRtSharedLibPrefix, kCompilerPluginLibPatternFmt);
+  return FindLiteRtSharedLibsHelper(root, lib_pattern, /*full_match=*/false,
+                                    results);
 }
 
-LiteRtStatus MakePluginLibGlobPattern(absl::string_view search_path,
-                                      std::string& pattern) {
-  bool search_path_ends_with_slash =
-      !search_path.empty() && (search_path[search_path.size() - 1] == '/');
-  LITERT_ENSURE(!search_path_ends_with_slash, kLiteRtStatusErrorInvalidArgument,
-                "Search paths must not have trailing slash");
+static const char kDispatchLibPatternFmt[] = "Dispatch";
 
-  // NOTE: Compiler plugin shared libraries also have "Plugin" somewhere after
-  // the standard prefix.
-  constexpr absl::string_view kGlobPluginLibTemplate = "%s/%s*Plugin*.so";
-  pattern = absl::StrFormat(kGlobPluginLibTemplate, search_path,
-                            kLiteRtSharedLibPrefix);
-  return kLiteRtStatusOk;
-}
-
-LiteRtStatus FindLiteRtSharedLibs(absl::string_view search_path,
-                                  std::vector<std::string>& results) {
-#ifndef __ANDROID__
-  std::string glob_pattern;
-  LITERT_RETURN_STATUS_IF_NOT_OK(
-      MakePluginLibGlobPattern(search_path, glob_pattern));
-
-  glob_t glob_result = {};
-  const int glob_status =
-      glob(glob_pattern.c_str(), GLOB_ERR, nullptr, &glob_result);
-  if (glob_status == GLOB_NOMATCH || glob_status == GLOB_ABORTED) {
-    LITERT_LOG(LITERT_WARNING, "%s", "Didn't find any plugin libs to load\n");
-    globfree(&glob_result);
-    return kLiteRtStatusOk;
-  } else if (glob_status != 0) {
-    LITERT_LOG(LITERT_ERROR, "Glob failed with code: %d\n", glob_status);
-    globfree(&glob_result);
-    return kLiteRtStatusErrorNotFound;
-  }
-
-  for (size_t i = 0; i < glob_result.gl_pathc; ++i) {
-    results.emplace_back().assign(glob_result.gl_pathv[i]);
-    LITERT_LOG(LITERT_INFO, "Glob matched: %s\n", results.back().c_str());
-  }
-
-  globfree(&glob_result);
-  return kLiteRtStatusOk;
-#endif
-  // TODO: Glob is not supported on android.
-  return kLiteRtStatusErrorUnsupported;
+LiteRtStatus FindLiteRtDispatchSharedLibs(absl::string_view search_path,
+                                          std::vector<std::string>& results) {
+  std::string root(search_path.data());
+  const std::string lib_pattern =
+      absl::StrCat(kLiteRtSharedLibPrefix, kDispatchLibPatternFmt);
+  return FindLiteRtSharedLibsHelper(root, lib_pattern, /*full_match=*/false,
+                                    results);
 }
 
 }  // namespace litert::internal

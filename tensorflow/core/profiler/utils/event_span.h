@@ -16,6 +16,7 @@ limitations under the License.
 #ifndef TENSORFLOW_CORE_PROFILER_UTILS_EVENT_SPAN_H_
 #define TENSORFLOW_CORE_PROFILER_UTILS_EVENT_SPAN_H_
 
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -203,7 +204,7 @@ class StepDetails {
  private:
   // Accumulates the device memory transfers from another step to this step.
   void AggregateDeviceMemoryTransfers(
-      const std::vector<DeviceMemoryTransfer> device_memory_transfers);
+      const std::vector<DeviceMemoryTransfer>& device_memory_transfers);
 
   // All step-markers found for marking this step in the traces. There could be
   // multiple step-markers for a single step for different reasons. One such

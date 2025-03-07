@@ -14,7 +14,11 @@
 
 package(
     # copybara:uncomment default_applicable_licenses = ["//tensorflow:license"],
-    default_visibility = ["//tensorflow/lite/experimental/litert:__subpackages__"],
+    default_visibility = [
+        # copybara:uncomment "//third_party/mediapipe/calculators/tensor:__subpackages__",
+        # copybara:uncomment "//third_party/odml/litert:__subpackages__",
+        "//tensorflow/lite/experimental/litert:__subpackages__",
+    ],
 )
 
 # TODO: b/365295276 - Make custom rule and move to `.sh`.
@@ -54,24 +58,23 @@ cc_library(
         "common.h",
     ],
     deps = [
-        "//tensorflow/compiler/mlir/lite:allocation",
         "//tensorflow/lite:framework",
-        "//tensorflow/lite:model_builder",
         "//tensorflow/lite/c:c_api_opaque",
         "//tensorflow/lite/c:common",
         "//tensorflow/lite/core:cc_api_stable",
         "//tensorflow/lite/experimental/litert/c:litert_common",
-        "//tensorflow/lite/experimental/litert/cc:litert_buffer_ref",
+        "//tensorflow/lite/experimental/litert/c:litert_logging",
         "//tensorflow/lite/experimental/litert/cc:litert_expected",
         "//tensorflow/lite/experimental/litert/cc:litert_model",
         "//tensorflow/lite/experimental/litert/cc:litert_model_predicates",
         "//tensorflow/lite/experimental/litert/core:filesystem",
         "//tensorflow/lite/experimental/litert/core/model:model_buffer",
-        "//tensorflow/lite/experimental/litert/core/model:model_load",
         "//tensorflow/lite/experimental/litert/core/util:flatbuffer_tools",
         "//tensorflow/lite/kernels:builtin_ops",
-        "//tensorflow/lite/schema:schema_fbs",
+        "@com_google_absl//absl/base:core_headers",
+        "@com_google_absl//absl/log:check",
         "@com_google_absl//absl/strings:string_view",
+        "@com_google_absl//absl/synchronization",
         "@local_tsl//tsl/platform",
     ],
 )
@@ -87,6 +90,7 @@ cc_library(
     ],
     deps = [
         "//tensorflow/lite/experimental/litert/c:litert_model",
+        "//tensorflow/lite/experimental/litert/cc:litert_layout",
     ],
 )
 
@@ -105,6 +109,26 @@ cc_library(
     ],
     deps = [
         "//tensorflow/lite/experimental/litert/c:litert_model",
+        "//tensorflow/lite/experimental/litert/cc:litert_layout",
+    ],
+)
+
+cc_library(
+    name = "simple_cascade_model_npu",
+    testonly = 1,
+    srcs = [],
+    hdrs = [
+        "testdata/simple_model_test_vectors.h",
+    ],
+    data = [
+        "testdata/simple_cascade_model_npu.tflite",
+        "testdata/simple_model_google_tensor.bin",
+        "testdata/simple_model_mtk.bin",
+        "testdata/simple_model_qualcomm.bin",
+    ],
+    deps = [
+        "//tensorflow/lite/experimental/litert/c:litert_model",
+        "//tensorflow/lite/experimental/litert/cc:litert_layout",
     ],
 )
 
@@ -116,3 +140,47 @@ cc_library(
         "@com_google_absl//absl/types:span",
     ],
 )
+
+cc_library(
+    name = "matchers",
+    testonly = True,
+    hdrs = ["matchers.h"],
+    deps = [
+        "//tensorflow/lite/experimental/litert/c:litert_common",
+        "//tensorflow/lite/experimental/litert/cc:litert_expected",
+        "@com_google_absl//absl/strings:string_view",
+        "@com_google_googletest//:gtest",
+    ],
+)
+
+cc_test(
+    name = "matchers_test",
+    srcs = ["matchers_test.cc"],
+    deps = [
+        ":matchers",
+        "//tensorflow/lite/experimental/litert/c:litert_common",
+        "//tensorflow/lite/experimental/litert/cc:litert_expected",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+# Use this library if you want to enforce an OSS environment for your test.
+cc_library(
+    name = "matchers_oss",
+    testonly = True,
+    hdrs = ["matchers.h"],
+    defines = ["LITERT_DEFINE_GTEST_STATUS_PRINTER"],
+    tags = ["avoid_dep"],
+    deps = [
+        "//tensorflow/lite/experimental/litert/c:litert_common",
+        "//tensorflow/lite/experimental/litert/cc:litert_expected",
+        "@com_google_absl//absl/strings:str_format",
+        "@com_google_absl//absl/strings:string_view",
+        "@com_google_googletest//:gtest",
+    ],
+)
+
+exports_files(srcs = [
+    "testdata/simple_model_google_tensor.bin",
+    "testdata/simple_model_qualcomm.bin",
+])

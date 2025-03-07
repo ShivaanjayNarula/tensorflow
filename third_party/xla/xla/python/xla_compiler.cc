@@ -15,11 +15,11 @@ limitations under the License.
 
 #include "xla/python/xla_compiler.h"
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <optional>
 #include <string>
-#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -63,9 +63,11 @@ limitations under the License.
 #include "xla/layout.h"
 #include "xla/layout_util.h"
 #include "xla/literal.h"
+#include "xla/pjrt/compile_options.pb.h"
 #include "xla/pjrt/exceptions.h"
 #include "xla/pjrt/pjrt_executable.h"
 #include "xla/pjrt/status_casters.h"
+#include "xla/python/dlpack.h"
 #include "xla/python/nb_absl_span.h"  // IWYU pragma: keep
 #include "xla/python/nb_helpers.h"
 #include "xla/python/nb_numpy.h"
@@ -81,13 +83,13 @@ limitations under the License.
 #include "xla/shape.h"
 #include "xla/shape_util.h"
 #include "xla/tsl/lib/strings/proto_serialization.h"
+#include "xla/tsl/platform/env.h"
+#include "xla/tsl/platform/errors.h"
+#include "xla/tsl/platform/logging.h"
+#include "xla/tsl/platform/statusor.h"
 #include "xla/util.h"
 #include "xla/xla.pb.h"
 #include "xla/xla_data.pb.h"
-#include "tsl/platform/env.h"
-#include "tsl/platform/errors.h"
-#include "tsl/platform/logging.h"
-#include "tsl/platform/statusor.h"
 
 namespace nanobind {
 namespace detail {
@@ -98,7 +100,7 @@ struct type_caster<xla::OpMetadata> {
   NB_TYPE_CASTER_FROM_PYTHON_ONLY(xla::OpMetadata,
                                   const_name("xla::OpMetadata"));
 
-  bool from_python(handle h, uint8_t, cleanup_list*) {
+  bool from_python(handle h, uint8_t, cleanup_list*) noexcept {
     handle op_type = getattr(h, "op_type");
     if (!op_type.is_none()) {
       value.set_op_type(cast<std::string>(op_type));
@@ -232,9 +234,8 @@ absl::StatusOr<Shape> MakeShapeWithDenseLayout(
     *shape.mutable_layout() = LayoutUtil::MakeLayout(*minor_to_major);
     TF_RETURN_IF_ERROR(
         LayoutUtil::ValidateLayoutForShape(shape.layout(), shape));
-  } else {
-    shape.clear_layout();
   }
+
   return shape;
 }
 
@@ -374,6 +375,20 @@ absl::Status PyRegisterCustomCallTarget(const std::string& fn_name,
       api_version));
 }
 
+absl::Status PyRegisterCustomTypeId(absl::string_view type_name,
+                                    nb::object type_id) {
+  nb::capsule capsule;
+  if (!nb::try_cast<nb::capsule>(type_id, capsule)) {
+    return absl::InvalidArgumentError(
+        "The type_id argument to register_custom_call_type_id must be a "
+        "PyCapsule object holding a pointer to a XLA_FFI_TypeId.");
+  }
+  XLA_FFI_TypeId* type_id_ptr =
+      reinterpret_cast<XLA_FFI_TypeId*>(static_cast<void*>(capsule.data()));
+  return ffi::TakeStatus(ffi::Ffi::RegisterTypeId(xla::ffi::GetXlaFfiApi(),
+                                                  type_name, type_id_ptr));
+}
+
 template <typename T, typename Container>
 void DefRepeatedProperty(nb::class_<T>& cls, const char* name,
                          Container* (T::*getter)()) {
@@ -441,6 +456,39 @@ absl::StatusOr<HloSharding> SubgroupWithTileAssignmentHelper(
     nb::ndarray<int64_t, nb::c_contig> tile_assignment,
     absl::Span<const OpSharding::Type> subgroup_types) {
   return HloSharding::Subgroup(NDArrayToArray(tile_assignment), subgroup_types);
+}
+
+nb::ndarray<> LiteralToNdarray(Literal& obj) {
+  const Shape& shape = obj.shape();
+
+  if (!shape.has_layout()) {
+    throw XlaRuntimeError(
+        "Creating an array is only supported for Literals with a layout.");
+  }
+
+  const Layout& layout = shape.layout();
+
+  if (!layout.tiles().empty()) {
+    throw XlaRuntimeError(
+        "Creating an array from a tiled Literal is not supported.");
+  }
+
+  if (!LayoutUtil::IsDenseArray(shape)) {
+    throw XlaRuntimeError(
+        "Creating an array is only supported for dense Literals.");
+  }
+
+  xla::PrimitiveType primitive_type = shape.element_type();
+  nb::dlpack::dtype dtype =
+      ValueOrThrow(PrimitiveTypeToNbDLDataType(primitive_type));
+
+  absl::Span<const int64_t> dimensions = shape.dimensions();
+  std::vector<size_t> unsigned_dimensions(dimensions.begin(), dimensions.end());
+  auto strides = StridesForShape(primitive_type, dimensions, layout);
+
+  return nb::ndarray<>(obj.untyped_data(), unsigned_dimensions.size(),
+                       unsigned_dimensions.data(), {}, strides.data(), dtype,
+                       nb::device::cpu::value, 0);
 }
 
 }  // namespace
@@ -666,7 +714,36 @@ void BuildXlaCompilerSubmodule(nb::module_& m) {
            [](const ShapeIndex& shape_ind) { return absl::HashOf(shape_ind); });
 
   // Literals
-  nb::class_<Literal>(m, "Literal").def("__repr__", &Literal::ToString);
+  nb::class_<Literal>(m, "Literal")
+      .def(nb::init<const Shape&>())
+      .def("__repr__", &Literal::ToString)
+      .def(
+          "__array__",
+          [](std::shared_ptr<Literal> obj, std::optional<nb::object> dtype,
+             std::optional<bool> copy) {
+            // Provides the interface required by numpy to create a np.ndarray.
+            // Currently don't support the __dl_pack__ interface but can be
+            // added with very little effort it if needed.
+
+            nb::ndarray<nb::numpy> np_array(LiteralToNdarray(*obj));
+
+            if (dtype.has_value()) {
+              throw XlaRuntimeError(
+                  "Passing of dtype to __array__ not currently supported.");
+            }
+
+            if (copy.has_value() && *copy) {
+              // when a copy is requested we _must_ return a copy:
+              // https://numpy.org/doc/2.1/reference/generated/numpy.ndarray.__array__.html
+              return np_array.cast(nb::rv_policy::copy);
+            }
+
+            return np_array.cast(nb::rv_policy::reference_internal,
+                                 nb::cast(obj));
+          },
+          nb::arg("dtype").none() = nb::none(),
+          nb::arg("copy").none() = nb::none())
+      .def("shape", &Literal::shape);
 
   nb::class_<XlaComputation>(m, "XlaComputation")
       .def("__init__",
@@ -1078,7 +1155,8 @@ void BuildXlaCompilerSubmodule(nb::module_& m) {
 
         for (const auto& [name, registration] : *ffi_handlers) {
           nb::dict bundle;
-          auto export_handler = [&](std::string_view name, XLA_FFI_Handler* h) {
+          auto export_handler = [&](absl::string_view name,
+                                    XLA_FFI_Handler* h) {
             if (h != nullptr) {
               bundle[nb::str(name.data(), name.size())] =
                   nb::capsule(reinterpret_cast<void*>(h));
@@ -1097,6 +1175,13 @@ void BuildXlaCompilerSubmodule(nb::module_& m) {
       .value("UNSPECIFIED", DebugOptions::AUTOTUNE_CACHE_MODE_UNSPECIFIED)
       .value("UPDATE", DebugOptions::AUTOTUNE_CACHE_MODE_UPDATE)
       .value("READ", DebugOptions::AUTOTUNE_CACHE_MODE_READ);
+
+  m.def(
+      "register_custom_type_id",
+      [](absl::string_view type_name, nb::object type_id) {
+        xla::ThrowIfError(PyRegisterCustomTypeId(type_name, type_id));
+      },
+      nb::arg("type_name"), nb::arg("type_id"));
 
   nb::class_<DebugOptions>(m, "DebugOptions")
       .def("__repr__", &DebugOptions::DebugString)
@@ -1287,12 +1372,34 @@ void BuildXlaCompilerSubmodule(nb::module_& m) {
                        : std::nullopt;
           },
           &ExecutableBuildOptions::set_device_assignment)
+      .def("compilation_environments_from_serialized_proto",
+           [](ExecutableBuildOptions& options,
+              const nb::bytes& serialized_proto) {
+             xla::CompilationEnvironmentsProto env_proto;
+             env_proto.ParseFromArray(serialized_proto.c_str(),
+                                      serialized_proto.size());
+             auto comp_envs = xla::ValueOrThrow(
+                 xla::CompilationEnvironments::CreateFromProto(env_proto));
+             *options.mutable_comp_envs() = std::move(*comp_envs);
+           })
       .def_prop_rw("exec_time_optimization_effort",
                    &ExecutableBuildOptions::exec_time_optimization_effort,
                    &ExecutableBuildOptions::set_exec_time_optimization_effort)
       .def_prop_rw("memory_fitting_effort",
                    &ExecutableBuildOptions::memory_fitting_effort,
                    &ExecutableBuildOptions::set_memory_fitting_effort)
+      .def_prop_rw(
+          "optimization_level", &ExecutableBuildOptions::optimization_level,
+          [](ExecutableBuildOptions& options, int value) {
+            options.set_optimization_level(
+                static_cast<xla::ExecutionOptions::EffortLevel>(value));
+          })
+      .def_prop_rw(
+          "memory_fitting_level", &ExecutableBuildOptions::memory_fitting_level,
+          [](ExecutableBuildOptions& options, int value) {
+            options.set_memory_fitting_level(
+                static_cast<xla::ExecutionOptions::EffortLevel>(value));
+          })
       .def_prop_rw("use_spmd_partitioning",
                    &ExecutableBuildOptions::use_spmd_partitioning,
                    &ExecutableBuildOptions::set_use_spmd_partitioning)
@@ -1438,33 +1545,48 @@ void BuildXlaCompilerSubmodule(nb::module_& m) {
       .def("is_manual", &xla::HloSharding::IsManual)
       .def("is_unknown", &xla::HloSharding::IsUnknown)
       .def("is_tiled", &xla::HloSharding::IsTiled)
+      .def("is_maximal", &xla::HloSharding::IsTileMaximal)
       .def("tile", [](const xla::HloSharding& self,
                       xla::Shape shape) { return self.TileShape(shape); })
-      .def("tuple_elements",
-           [](const xla::HloSharding& self) { return self.tuple_elements(); })
-      .def("num_devices",
-           [](const xla::HloSharding& self) {
-             return self.tile_assignment().num_elements();
-           })
-      .def("num_dimensions",
-           [](const xla::HloSharding& self) {
-             return self.tile_assignment().num_dimensions();
-           })
-      .def("tile_assignment_dimensions",
-           [](const xla::HloSharding& self) {
-             absl::Span<int64_t const> span =
-                 self.tile_assignment().dimensions();
-             CHECK(span.data());
-             return span;
-           })
-      .def("tile_assignment_devices",
-           [](const xla::HloSharding& self) {
-             auto span =
-                 absl::MakeConstSpan(self.tile_assignment().array().data(),
-                                     self.tile_assignment().num_elements());
-             CHECK(span.data());
-             return span;
-           })
+      // tile_assignment.array() is computed using an internal cache,
+      // which is why nb::lock_self() is required. It may be preferable to move
+      // this locking into the TileAssignment class if we find it to race with
+      // non-Python users of that class.
+      .def(
+          "tuple_elements",
+          [](const xla::HloSharding& self) { return self.tuple_elements(); },
+          nb::lock_self())
+      .def(
+          "num_devices",
+          [](const xla::HloSharding& self) {
+            return self.tile_assignment().num_elements();
+          },
+          nb::lock_self())
+      .def(
+          "num_dimensions",
+          [](const xla::HloSharding& self) {
+            return self.tile_assignment().num_dimensions();
+          },
+          nb::lock_self())
+      .def(
+          "tile_assignment_dimensions",
+          [](const xla::HloSharding& self) {
+            absl::Span<int64_t const> span =
+                self.tile_assignment().dimensions();
+            CHECK(span.data());
+            return span;
+          },
+          nb::lock_self())
+      .def(
+          "tile_assignment_devices",
+          [](const xla::HloSharding& self) {
+            auto span =
+                absl::MakeConstSpan(self.tile_assignment().array().data(),
+                                    self.tile_assignment().num_elements());
+            CHECK(span.data());
+            return span;
+          },
+          nb::lock_self())
       .def("replicate_on_last_tile_dim",
            &xla::HloSharding::ReplicateOnLastTileDim)
       .def("subgroup_types", &xla::HloSharding::subgroup_types)
@@ -1483,6 +1605,10 @@ void BuildXlaCompilerSubmodule(nb::module_& m) {
       .value("DEFAULT", PrecisionConfig::DEFAULT)
       .value("HIGH", PrecisionConfig::HIGH)
       .value("HIGHEST", PrecisionConfig::HIGHEST);
+
+  nb::enum_<ResultAccuracy::Mode>(m, "ResultAccuracy_Mode")
+      .value("DEFAULT", ResultAccuracy::DEFAULT)
+      .value("HIGHEST", ResultAccuracy::HIGHEST);
 
   nb::enum_<FftType>(m, "FftType")
       .value("FFT", FftType::FFT)

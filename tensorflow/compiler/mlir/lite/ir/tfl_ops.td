@@ -3030,6 +3030,8 @@ def TFL_ReshapeOp: TFL_Op<"reshape", [
 
   let extraClassDeclaration = [{
     static bool isCompatibleReturnTypes(TypeRange l, TypeRange r);
+    // Quantized axes are verified in the Verify function.
+    bool RequiredSameQuantizedAxes() { return false; }
   }];
 }
 
@@ -3284,7 +3286,7 @@ def TFL_SoftmaxOp : TFL_Op<"softmax", [
   let description = [{
     Computes element-wise softmax activations with the following formula
 
-      exp(input) / tf.reduce_sum(exp(input * beta), dim)
+      exp(input * beta) / tf.reduce_sum(exp(input * beta), dim)
   }];
 
   let arguments = (
@@ -3552,12 +3554,12 @@ def TFL_TransposeOp : TFL_Op<"transpose", [
   }];
 
   let arguments = (ins
-    TFL_TensorOf<[I32, F32, I8, UI8, QI8, QUI8, TFL_Quint8, I1, I64, QI16]>:$input,
+    TFL_TensorOf<[I32, F32, I8, UI8, QI8, QUI8, TFL_I4, QI4, TFL_Quint8, I1, I64, QI16]>:$input,
     TFL_TensorOf<[I32]>:$perm
   );
 
   let results = (outs
-    TFL_TensorOf<[I32, F32, I8, UI8, QI8, QUI8, TFL_Quint8, I1, I64, QI16]>:$output
+    TFL_TensorOf<[I32, F32, I8, UI8, QI8, QUI8, TFL_I4, QI4, TFL_Quint8, I1, I64, QI16]>:$output
   );
 
   let hasVerifier = 1;
@@ -3973,7 +3975,10 @@ def TFL_CastOp : TFL_Op<"cast", [
     TFL_TensorOf<[F16, BF16, F32, F64, I1, TFL_I4, I16, UI16, I32, UI32, I64, TFL_Quint8, UI8, I8, Complex<F<32>>]>:$input
   );
 
-  let results = (outs TFL_TensorOf<[F16, BF16, F32, F64, I1, I16, UI16, I32, UI32, I64, TFL_Quint8, UI8, I8, Complex<F<32>>]>:$output);
+  // TODO(b/393644251): Temporary support for INT4 TFL_CastOp. Runtime
+  // probably already supports INT4. We should remove the INT4 support here or
+  // make sure the runtime supports is there, as part of closing the bug.
+  let results = (outs TFL_TensorOf<[F16, BF16, F32, F64, I1, TFL_I4, I16, UI16, I32, UI32, I64, TFL_Quint8, UI8, I8, Complex<F<32>>]>:$output);
 
   // TFLite's cast op does not utilize CastOptions, instead derives types
   // from the TfLiteTensors.
@@ -3981,7 +3986,7 @@ def TFL_CastOp : TFL_Op<"cast", [
 
   let hasFolder = 1;
 }
-// LINT.ThenChange(//tensorflow/compiler/mlir/lite/transforms/while_loop_outline_pass.cc)
+// LINT.ThenChange(//tensorflow/compiler/mlir/lite/transforms/tf_legalizations/while_loop_outline_pass.cc)
 
 def TFL_MirrorPadOp: TFL_Op<"mirror_pad", [
                      SameOperandsAndResultsScale,

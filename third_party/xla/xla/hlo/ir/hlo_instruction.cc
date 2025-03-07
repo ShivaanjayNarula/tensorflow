@@ -78,12 +78,12 @@ limitations under the License.
 #include "xla/status_macros.h"
 #include "xla/tsl/lib/gtl/iterator_range.h"
 #include "xla/tsl/lib/gtl/map_util.h"
+#include "xla/tsl/platform/errors.h"
+#include "xla/tsl/platform/logging.h"  // IWYU pragma: keep
+#include "xla/tsl/platform/status.h"
+#include "xla/tsl/platform/statusor.h"
 #include "xla/util.h"
 #include "xla/xla_data.pb.h"
-#include "tsl/platform/errors.h"
-#include "tsl/platform/logging.h"  // IWYU pragma: keep
-#include "tsl/platform/status.h"
-#include "tsl/platform/statusor.h"
 
 namespace xla {
 
@@ -220,6 +220,23 @@ void HloInstruction::AppendComputation(HloComputation* computation) {
   mutable_rare()->called_computations.push_back(computation);
 }
 
+void HloInstruction::set_called_computation(int index,
+                                            HloComputation* computation) {
+  mutable_rare()->called_computations[index] = computation;
+  // TODO(b/399394039): Consider also enforcing that computation->parent() !=
+  // nullptr.
+  CHECK(parent() == nullptr || parent()->parent() == nullptr ||
+        parent()->parent() == computation->parent())
+      << ToString();
+}
+
+void HloInstruction::ReplaceCalledComputations(
+    absl::FunctionRef<HloComputation*(HloComputation*)> map_function) {
+  for (int64_t i = 0; i < called_computations().size(); ++i) {
+    set_called_computation(i, map_function(rare()->called_computations[i]));
+  }
+}
+
 HloInstruction* HloInstruction::AddInstruction(
     std::unique_ptr<HloInstruction> derived_instruction) {
   HloInstruction* derived =
@@ -327,6 +344,11 @@ absl::StatusOr<std::unique_ptr<HloInstruction>> HloInstruction::CreateFromProto(
     TF_RET_CHECK(proto.operand_ids_size() == *arity)
         << proto.opcode() << " instruction should have " << *arity
         << " operands but sees " << proto.operand_ids_size();
+  }
+
+  std::optional<int64_t> channel_id;
+  if (proto.channel_id() > 0) {
+    channel_id = proto.channel_id();
   }
 
   switch (opcode) {
@@ -459,22 +481,24 @@ absl::StatusOr<std::unique_ptr<HloInstruction>> HloInstruction::CreateFromProto(
       break;
     }
     case HloOpcode::kSend:
-      instruction = CreateSend(operands(0), operands(1), proto.channel_id(),
+      instruction = CreateSend(operands(0), operands(1), channel_id,
                                proto.is_host_transfer());
       break;
     case HloOpcode::kSendDone:
       TF_RET_CHECK(DynCast<HloSendInstruction>(operands(0)) != nullptr)
           << "SendDone must take the context operand from Send";
-      instruction = CreateSendDone(operands(0), proto.is_host_transfer());
+      instruction =
+          CreateSendDone(operands(0), channel_id, proto.is_host_transfer());
       break;
     case HloOpcode::kRecv:
-      instruction = CreateRecv(shape.tuple_shapes(0), operands(0),
-                               proto.channel_id(), proto.is_host_transfer());
+      instruction = CreateRecv(shape.tuple_shapes(0), operands(0), channel_id,
+                               proto.is_host_transfer());
       break;
     case HloOpcode::kRecvDone:
       TF_RET_CHECK(DynCast<HloRecvInstruction>(operands(0)) != nullptr)
           << "RecvDone must take the context operand from Recv";
-      instruction = CreateRecvDone(operands(0), proto.is_host_transfer());
+      instruction =
+          CreateRecvDone(operands(0), channel_id, proto.is_host_transfer());
       break;
     case HloOpcode::kReverse:
       instruction =
@@ -771,8 +795,6 @@ absl::StatusOr<std::unique_ptr<HloInstruction>> HloInstruction::CreateFromProto(
     }
     case HloOpcode::kCollectivePermute:
     case HloOpcode::kCollectivePermuteStart: {
-      TF_RET_CHECK(proto.operand_ids().size() == 1 ||
-                   proto.operand_ids().size() == 4);
       std::vector<std::pair<int64_t, int64_t>> source_target_pairs(
           proto.source_target_pairs_size());
       std::optional<int64_t> channel_id;
@@ -786,10 +808,10 @@ absl::StatusOr<std::unique_ptr<HloInstruction>> HloInstruction::CreateFromProto(
       if (proto.dynamic_slice_sizes_size() == 0) {
         if (opcode == HloOpcode::kCollectivePermute) {
           instruction = CreateCollectivePermute(
-              shape, operands(0), source_target_pairs, channel_id);
+              shape, all_operands(), source_target_pairs, channel_id);
         } else if (opcode == HloOpcode::kCollectivePermuteStart) {
           instruction = CreateCollectivePermuteStart(
-              shape, operands(0), source_target_pairs, channel_id);
+              shape, all_operands(), source_target_pairs, channel_id);
         } else {
           LOG(FATAL) << "Expect CollectivePermute or CollectivePermuteStart, "
                      << "but got " << opcode;
@@ -1439,8 +1461,13 @@ HloInstruction::CreateRngBitGenerator(const Shape& shape, HloInstruction* state,
     case HloOpcode::kTanh:
     case HloOpcode::kTan:
       if (result_accuracy.has_value()) {
-        return std::make_unique<HloUnaryInstruction>(shape, opcode, operand,
-                                                     *result_accuracy);
+        std::unique_ptr<HloInstruction> instruction =
+            CreateNary(shape, opcode, {operand});
+        if (!IsValidResultAccuracy(*result_accuracy)) {
+          LOG(FATAL) << "Invalid result accuracy";
+        }
+        instruction->set_result_accuracy(result_accuracy.value());
+        return instruction;
       }
       return CreateNary(shape, opcode, {operand});
     default:
@@ -1496,7 +1523,8 @@ HloInstruction::CreateRngBitGenerator(const Shape& shape, HloInstruction* state,
 /* static */ std::unique_ptr<HloInstruction> HloInstruction::CreateVariadic(
     const Shape& shape, HloOpcode opcode,
     absl::Span<HloInstruction* const> operands) {
-  CHECK_EQ(HloOpcode::kTuple, opcode);
+  std::optional<int> arity = HloOpcodeArity(opcode);
+  CHECK(!arity.has_value() || arity.value() == operands.size());
   return CreateNary(shape, opcode, operands);
 }
 
@@ -1774,7 +1802,18 @@ HloInstruction::CreateCollectivePermute(
     const std::vector<std::pair<int64_t, int64_t>>& source_target_pairs,
     const std::optional<int64_t>& channel_id) {
   return std::make_unique<HloCollectivePermuteInstruction>(
-      HloOpcode::kCollectivePermute, shape, operand, source_target_pairs,
+      HloOpcode::kCollectivePermute, shape,
+      absl::Span<HloInstruction* const>(&operand, 1), source_target_pairs,
+      channel_id);
+}
+// overloaded function of above CreateCollectivePermute for multiple operands
+/* static */ std::unique_ptr<HloInstruction>
+HloInstruction::CreateCollectivePermute(
+    const Shape& shape, absl::Span<HloInstruction* const> operands,
+    const std::vector<std::pair<int64_t, int64_t>>& source_target_pairs,
+    const std::optional<int64_t>& channel_id) {
+  return std::make_unique<HloCollectivePermuteInstruction>(
+      HloOpcode::kCollectivePermute, shape, operands, source_target_pairs,
       channel_id);
 }
 
@@ -1796,7 +1835,19 @@ HloInstruction::CreateCollectivePermuteStart(
     const std::vector<std::pair<int64_t, int64_t>>& source_target_pairs,
     const std::optional<int64_t>& channel_id) {
   return std::make_unique<HloCollectivePermuteInstruction>(
-      HloOpcode::kCollectivePermuteStart, shape, operand, source_target_pairs,
+      HloOpcode::kCollectivePermuteStart, shape,
+      absl::Span<HloInstruction* const>(&operand, 1), source_target_pairs,
+      channel_id);
+}
+// overloaded function of above CreateCollectivePermuteStart for multiple
+// operands
+/* static */ std::unique_ptr<HloInstruction>
+HloInstruction::CreateCollectivePermuteStart(
+    const Shape& shape, absl::Span<HloInstruction* const> operands,
+    const std::vector<std::pair<int64_t, int64_t>>& source_target_pairs,
+    const std::optional<int64_t>& channel_id) {
+  return std::make_unique<HloCollectivePermuteInstruction>(
+      HloOpcode::kCollectivePermuteStart, shape, operands, source_target_pairs,
       channel_id);
 }
 
@@ -1844,45 +1895,29 @@ HloInstruction::CreateCollectivePermuteStart(
 }
 
 /* static */ std::unique_ptr<HloInstruction> HloInstruction::CreateSend(
-    HloInstruction* operand, HloInstruction* token, int64_t channel_id,
-    bool is_host_transfer) {
+    HloInstruction* operand, HloInstruction* token,
+    std::optional<int64_t> channel_id, bool is_host_transfer) {
   return std::make_unique<HloSendInstruction>(operand, token, channel_id,
                                               is_host_transfer);
 }
 
 /* static */ std::unique_ptr<HloInstruction> HloInstruction::CreateSendDone(
-    HloInstruction* operand, bool is_host_transfer) {
-  auto send_operand = DynCast<HloSendInstruction>(operand);
-  CHECK(send_operand != nullptr)
-      << "SendDone must take the context operand from Send";
-  return std::make_unique<HloSendDoneInstruction>(send_operand,
-                                                  is_host_transfer);
-}
-
-/* static */ std::unique_ptr<HloInstruction> HloInstruction::CreateSendDone(
-    HloInstruction* operand, int64_t channel_id, bool is_host_transfer) {
+    HloInstruction* operand, std::optional<int64_t> channel_id,
+    bool is_host_transfer) {
   return std::make_unique<HloSendDoneInstruction>(operand, channel_id,
                                                   is_host_transfer);
 }
 
 /* static */ std::unique_ptr<HloInstruction> HloInstruction::CreateRecv(
-    const Shape& shape, HloInstruction* token, int64_t channel_id,
-    bool is_host_transfer) {
+    const Shape& shape, HloInstruction* token,
+    std::optional<int64_t> channel_id, bool is_host_transfer) {
   return std::make_unique<HloRecvInstruction>(shape, token, channel_id,
                                               is_host_transfer);
 }
 
 /* static */ std::unique_ptr<HloInstruction> HloInstruction::CreateRecvDone(
-    HloInstruction* operand, bool is_host_transfer) {
-  auto recv_operand = DynCast<HloRecvInstruction>(operand);
-  CHECK(recv_operand != nullptr)
-      << "RecvDone must take the context operand from Recv";
-  return std::make_unique<HloRecvDoneInstruction>(recv_operand,
-                                                  is_host_transfer);
-}
-
-/* static */ std::unique_ptr<HloInstruction> HloInstruction::CreateRecvDone(
-    HloInstruction* operand, int64_t channel_id, bool is_host_transfer) {
+    HloInstruction* operand, std::optional<int64_t> channel_id,
+    bool is_host_transfer) {
   return std::make_unique<HloRecvDoneInstruction>(operand, channel_id,
                                                   is_host_transfer);
 }
@@ -2298,6 +2333,7 @@ void HloInstruction::SetupDerivedInstruction(
   }
   derived_instruction->set_metadata(*metadata_);
   if (has_rare()) {
+    derived_instruction->set_result_accuracy(result_accuracy());
     derived_instruction->set_frontend_attributes(frontend_attributes());
     derived_instruction->set_statistics_viz(statistics_viz());
   } else if (derived_instruction->has_rare()) {
@@ -2499,17 +2535,6 @@ HloInstruction::CreateCompositeCall(const Shape& shape,
          execution_threads_set.contains(execution_thread);
 }
 
-/* static */ bool HloInstruction::IsUnaryOpWithResultAccuracy(
-    HloOpcode opcode) {
-  return opcode == HloOpcode::kExp || opcode == HloOpcode::kExpm1 ||
-         opcode == HloOpcode::kLog || opcode == HloOpcode::kLog1p ||
-         opcode == HloOpcode::kRsqrt || opcode == HloOpcode::kSqrt ||
-         opcode == HloOpcode::kCbrt || opcode == HloOpcode::kTanh ||
-         opcode == HloOpcode::kCos || opcode == HloOpcode::kSin ||
-         opcode == HloOpcode::kTan || opcode == HloOpcode::kErf ||
-         opcode == HloOpcode::kLogistic;
-}
-
 void HloInstruction::AddSuffixToInstructionName(
     const absl::string_view suffix) {
   // If an instruction is cloned multiple times avoid names like
@@ -2601,6 +2626,7 @@ std::unique_ptr<HloInstruction> HloInstruction::CloneWithNewOperands(
     case HloOpcode::kReduceScatter:
     case HloOpcode::kAllReduceStart:
     case HloOpcode::kAllToAll:
+    case HloOpcode::kRaggedAllToAll:
     case HloOpcode::kCollectiveBroadcast:
     case HloOpcode::kCollectivePermute:
     case HloOpcode::kCollectivePermuteStart:
@@ -2661,7 +2687,7 @@ std::unique_ptr<HloInstruction> HloInstruction::CloneWithNewOperands(
     case HloOpcode::kTan:
     case HloOpcode::kTanh:
       CHECK_EQ(new_operands.size(), 1);
-      clone = CreateUnary(shape, opcode_, new_operands[0]);
+      clone = CreateUnary(shape, opcode_, new_operands[0], result_accuracy());
       break;
     // Binary ops.
     case HloOpcode::kAdd:
@@ -2753,7 +2779,6 @@ std::unique_ptr<HloInstruction> HloInstruction::CloneWithNewOperands(
   }
   // SetupDerivedInstruction will setup the precision_config_ field.
   SetupDerivedInstruction(clone.get());
-  clone->set_parent(parent_);
   clone->backend_config_ = BackendConfigWrapper(backend_config_);
   // The new instruction's name will be uniquified when it's added to a
   // computation.
@@ -2990,6 +3015,9 @@ bool HloInstruction::IdenticalInternal(
   if (operands().size() != other.operands().size()) {
     return false;
   }
+  if (!equal_result_accuracy(&other)) {
+    return false;
+  }
 
   // Check that operands are equal.
   //
@@ -3032,6 +3060,13 @@ void HloInstruction::AppendOperand(HloInstruction* operand) {
   }
   operands_.push_back(operand);
   operand->AddUser(this);
+}
+
+void HloInstruction::AppendOperands(
+    absl::Span<HloInstruction* const> operands) {
+  for (HloInstruction* operand : operands) {
+    HloInstruction::AppendOperand(operand);
+  }
 }
 
 void HloInstruction::RemoveOperandsAtAscendingIndices(
@@ -3499,7 +3534,7 @@ void HloInstruction::set_to_apply(HloComputation* computation) {
   if (has_to_apply()) {
     CHECK_EQ(called_computations().size(), 1)
         << "Expected a to_apply computation for " << opcode();
-    rare_->called_computations[0] = computation;
+    set_called_computation(0, computation);
     return;
   }
   LOG(FATAL) << "Invalid opcode for to_apply(): " << opcode();
@@ -3538,12 +3573,12 @@ HloComputation* HloInstruction::while_body() const {
 
 void HloInstruction::set_while_condition(HloComputation* computation) {
   CHECK_EQ(HloOpcode::kWhile, opcode_);
-  rare_->called_computations[kConditionComputationIndex] = computation;
+  set_called_computation(kConditionComputationIndex, computation);
 }
 
 void HloInstruction::set_while_body(HloComputation* computation) {
   CHECK_EQ(HloOpcode::kWhile, opcode_);
-  rare_->called_computations[kBodyComputationIndex] = computation;
+  set_called_computation(kBodyComputationIndex, computation);
 }
 
 HloInstruction* HloInstruction::while_init() const {
@@ -3595,7 +3630,7 @@ int32_t HloInstruction::branch_index(HloComputation* computation) const {
 void HloInstruction::set_branch_computation(int b,
                                             HloComputation* computation) {
   CHECK_EQ(HloOpcode::kConditional, opcode_);
-  rare_->called_computations[b] = computation;
+  set_called_computation(b, computation);
 }
 
 std::string HloInstruction::SignatureString() const {
@@ -4187,6 +4222,21 @@ void HloInstruction::PrintExtraAttributes(
                 "statistics=", StatisticsVizToString(statistics_viz()));
     });
   }
+  // ResultAccuracy can only be one of mode or tolerance.
+  // Don't print anything if the result accuracy is set to default.
+  if (result_accuracy().mode() != ResultAccuracy::DEFAULT) {
+    printer.Next([this](Printer* printer) {
+      printer->Append("result_accuracy={mode=");
+      printer->Append(ResultAccuracyToString(result_accuracy().mode()));
+      printer->Append("}");
+    });
+  } else if (result_accuracy().has_tolerance()) {
+    printer.Next([this](Printer* printer) {
+      AppendCat(printer, "result_accuracy={",
+                ResultAccuracyToleranceToString(result_accuracy().tolerance()),
+                "}");
+    });
+  }
 }
 
 std::vector<std::string> HloInstruction::ExtraAttributesToString(
@@ -4276,6 +4326,10 @@ HloInstructionProto HloInstruction::ToProto() const {
 
   if (original_value_) {
     *proto.mutable_original_value() = OriginalValueToProto(*original_value_);
+  }
+
+  if (has_result_accuracy()) {
+    *proto.mutable_result_accuracy() = result_accuracy();
   }
 
   return proto;
@@ -5050,6 +5104,24 @@ std::string ResultAccuracyToleranceToString(
 
 std::string ResultAccuracyToString(ResultAccuracy::Mode accuracy_mode) {
   return absl::StrFormat("%v", accuracy_mode);
+}
+
+bool IsValidResultAccuracy(const ResultAccuracy& accuracy) {
+  bool valid_mode = ResultAccuracy::Mode_IsValid(accuracy.mode());
+  bool valid_tolerance =
+      (accuracy.tolerance().rtol() >= 0 && accuracy.tolerance().ulps() >= 0 &&
+       accuracy.tolerance().atol() >= 0);
+  return valid_mode && valid_tolerance;
+}
+
+bool IsUnaryOpWithResultAccuracy(HloOpcode opcode) {
+  return opcode == HloOpcode::kExp || opcode == HloOpcode::kExpm1 ||
+         opcode == HloOpcode::kLog || opcode == HloOpcode::kLog1p ||
+         opcode == HloOpcode::kRsqrt || opcode == HloOpcode::kSqrt ||
+         opcode == HloOpcode::kCbrt || opcode == HloOpcode::kTanh ||
+         opcode == HloOpcode::kCos || opcode == HloOpcode::kSin ||
+         opcode == HloOpcode::kTan || opcode == HloOpcode::kErf ||
+         opcode == HloOpcode::kLogistic;
 }
 
 std::string AlgorithmToString(const PrecisionConfig::Algorithm& algorithm) {

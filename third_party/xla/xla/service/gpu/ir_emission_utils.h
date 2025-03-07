@@ -33,9 +33,9 @@ limitations under the License.
 #include "xla/hlo/ir/backend_config.h"
 #include "xla/hlo/ir/hlo_instruction.h"
 #include "xla/hlo/ir/hlo_instructions.h"
+#include "xla/hlo/utils/hlo_traversal.h"
 #include "xla/literal.h"
 #include "xla/service/buffer_assignment.h"
-#include "xla/service/gpu/hlo_traversal.h"
 #include "xla/shape.h"
 #include "xla/shape_util.h"
 #include "xla/util.h"
@@ -64,7 +64,10 @@ inline constexpr int64_t kMaxBytesInMostMinorDimension = 8;
 bool IsMatrixMultiplication(const HloInstruction& dot);
 bool IsMatrixVectorMultiplication(const HloInstruction& dot);
 
-inline constexpr int64_t WarpSize() { return 32; }
+inline constexpr int64_t WarpSize(
+    const se::DeviceDescription& gpu_device_info) {
+  return gpu_device_info.threads_per_warp();
+}
 
 // Fusions that implemented with pre-compiled device kernels have
 // FusionBackendConfig.kind requel to this string.
@@ -84,6 +87,29 @@ inline constexpr absl::string_view kUncompilableFusion =
     "__uncompilable_fusion";
 
 inline constexpr absl::string_view kTopKCustomCallTarget = "__gpu$TopK";
+
+// The name of the custom fusion config for dynamic slice fusion with static
+// slices, such that the offset can be computed at compile time.
+inline constexpr absl::string_view
+    kDynamicSliceFusionWithStaticAddressComputationConfigName =
+        "address_computation";
+// The name of the custom fusion config for dynamic slice fusion with dynamic
+// slices, such that the offset is computed at runtime.
+inline constexpr absl::string_view
+    kDynamicSliceFusionWithDynamicAddressComputationConfigName =
+        "dynamic_address_computation";
+
+// Returns the name of the custom fusion config if the given instruction is a
+// custom fusion and has a custom fusion name, otherwise returns std::nullopt.
+// The custom fusion name is basically the value of
+// instr.backend_config().fusion_backend_config().custom_fusion_config().name().
+// If any of this does not exist in the chain, then we return std::nullopt.
+std::optional<std::string> GetCustomFusionConfigName(
+    const HloInstruction* instr);
+
+// Returns true if the given instruction is a custom fusion for dynamic slice
+// fusion. This is determined by checking the name of custom fusion config.
+bool IsDynamicSliceFusion(const HloInstruction* instr);
 
 // Returns true if `hlo` will be implemented as a call to a cuSolver routine.
 //

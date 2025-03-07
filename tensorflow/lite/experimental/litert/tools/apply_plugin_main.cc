@@ -15,15 +15,15 @@
 #include <memory>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include "absl/strings/str_format.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/Support/CommandLine.h"
-#include "tensorflow/lite/experimental/litert/core/byte_code_util.h"
+#include "tensorflow/lite/experimental/litert/compiler/plugin/compiler_flags.h"
 #include "tensorflow/lite/experimental/litert/tools/apply_plugin.h"
 #include "tensorflow/lite/experimental/litert/tools/outstream.h"
 
-using ::litert::internal::Serialization;
 using ::litert::tools::ApplyPlugin;
 using ::litert::tools::ApplyPluginRun;
 using ::litert::tools::UserStream;
@@ -60,14 +60,16 @@ static llvm::cl::list<std::string> libs(
     llvm::cl::list_init(llvm::ArrayRef<std::string>{
         "third_party/tensorflow/lite/experimental/litert/vendors/examples",
         "third_party/tensorflow/lite/experimental/litert/vendors/qualcomm/"
-        "compiler"}));
+        "compiler",
+        "third_party/tensorflow/lite/experimental/litert/vendors/"
+        "google_tensor/compiler"}));
 
 // NOLINTNEXTLINE
-static llvm::cl::opt<std::string> out(
+static llvm::cl::list<std::string> outs(
     "o",
-    llvm::cl::desc("Path to file for output, \"-\" indicates standard out, "
+    llvm::cl::desc("Path to files for output, \"-\" indicates standard out, "
                    "\"--\" for standard err, \"none\" for null stream."),
-    llvm::cl::init("-"));
+    llvm::cl::list_init(llvm::ArrayRef<std::string>{"-"}));
 
 // NOLINTNEXTLINE
 static llvm::cl::opt<std::string> err(
@@ -77,9 +79,12 @@ static llvm::cl::opt<std::string> err(
     llvm::cl::init("--"));
 
 // NOLINTNEXTLINE
-static llvm::cl::opt<std::string> serialization(
-    "serialization", llvm::cl::desc("Serialization strategy to use."),
-    llvm::cl::init("METADATA"));
+static llvm::cl::opt<std::string> compiler_flags(
+    "compiler-flags",
+    llvm::cl::desc("List of comma separated (no space) compiler flags. Flags "
+                   "may be key-value pairs "
+                   "in the format of \"key=value\", or just \"key\". E.g. "
+                   "\"--compiler-flags=key1=value1,key2\""));
 
 ApplyPluginRun::Ptr ParseFlags() {
   auto res = std::make_unique<ApplyPluginRun>();
@@ -87,6 +92,8 @@ ApplyPluginRun::Ptr ParseFlags() {
   if (!model.empty()) {
     res->model = model;
   }
+
+  res->compiler_flags = *litert::internal::ParseCompilerFlags(compiler_flags);
 
   res->soc_manufacturer = soc_manufacturer;
   res->soc_models.push_back(soc_model);
@@ -107,14 +114,6 @@ ApplyPluginRun::Ptr ParseFlags() {
     return nullptr;
   }
 
-  if (serialization == "METADATA") {
-    res->serialization = Serialization::kMetadata;
-  } else if (serialization == "APPEND") {
-    res->serialization = Serialization::kAppend;
-  } else {
-    res->serialization = Serialization::kUnknown;
-  }
-
   return res;
 }
 
@@ -126,9 +125,13 @@ int main(int argc, char* argv[]) {
     return 1;
   }
 
-  auto out_stream = UserStream::MakeFromFlag(out);
   run->outs.clear();
-  run->outs.push_back(out_stream.Get());
+  std::vector<std::unique_ptr<litert::tools::UserStream>> oss;
+  for (const auto& out : outs) {
+    oss.push_back(std::make_unique<litert::tools::UserStream>(
+        UserStream::MakeFromFlag(out)));
+    run->outs.push_back(oss.back()->Get());
+  }
 
   run->dump_out = UserStream::MakeFromFlag(err);
 

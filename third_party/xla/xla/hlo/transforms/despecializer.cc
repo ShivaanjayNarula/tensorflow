@@ -15,14 +15,23 @@ limitations under the License.
 
 #include "xla/hlo/transforms/despecializer.h"
 
+#include <cstdint>
 #include <iterator>
 #include <utility>
 #include <vector>
 
+#include "absl/algorithm/container.h"
+#include "absl/container/flat_hash_set.h"
+#include "absl/log/log.h"
+#include "absl/status/statusor.h"
+#include "absl/strings/string_view.h"
+#include "xla/hlo/ir/hlo_casting_utils.h"
+#include "xla/hlo/ir/hlo_instructions.h"
 #include "xla/hlo/transforms/defuser.h"
 #include "xla/hlo/transforms/simplifiers/float_normalization.h"
 #include "xla/hlo/transforms/simplifiers/hlo_memory_scheduler.h"
 #include "xla/hlo/transforms/simplifiers/sub_byte_normalization.h"
+#include "xla/xla_data.pb.h"
 
 namespace xla {
 
@@ -89,10 +98,7 @@ absl::StatusOr<bool> DeconstructReduceWindowToReduceBroadcast::Run(
   std::vector<std::pair<HloInstruction*, int64_t>> candidate_rw;
   for (HloComputation* computation : module->computations()) {
     for (HloInstruction* instruction : computation->instructions()) {
-      if (instruction->opcode() != HloOpcode::kReduceWindow) {
-        continue;
-      }
-      auto* reduce_window = CastOrNull<HloReduceWindowInstruction>(instruction);
+      auto* reduce_window = DynCast<HloReduceWindowInstruction>(instruction);
       if (reduce_window == nullptr) {
         continue;
       }

@@ -15,23 +15,24 @@ limitations under the License.
 
 #include "tensorflow/core/profiler/utils/derived_timeline.h"
 
+#include <cstddef>
 #include <cstdint>
 #include <map>
 #include <optional>
 
 #include <gtest/gtest.h>
+#include "absl/log/log.h"
 #include "absl/strings/string_view.h"
 #include "xla/tsl/profiler/utils/group_events.h"
 #include "xla/tsl/profiler/utils/tf_xplane_visitor.h"
 #include "xla/tsl/profiler/utils/xplane_schema.h"
 #include "tensorflow/core/platform/test.h"
-#include "tensorflow/core/platform/types.h"
-#include "tensorflow/core/profiler/protobuf/xplane.pb.h"
 #include "tensorflow/core/profiler/utils/trace_utils.h"
 #include "tensorflow/core/profiler/utils/xplane_builder.h"
 #include "tensorflow/core/profiler/utils/xplane_schema.h"
 #include "tensorflow/core/profiler/utils/xplane_test_utils.h"
 #include "tensorflow/core/profiler/utils/xplane_visitor.h"
+#include "tsl/profiler/protobuf/xplane.pb.h"
 
 namespace tensorflow {
 namespace profiler {
@@ -68,6 +69,73 @@ TEST(DerivedTimelineTest, HloModuleNameTest) {
     if (line_visitor.Id() == 0) return;
     EXPECT_EQ(line_visitor.Id(), kThreadIdHloModule);
     EXPECT_EQ(line_visitor.NumEvents(), 1);
+    line_visitor.ForEachEvent([&](const XEventVisitor& event_visitor) {
+      EXPECT_EQ(event_visitor.Name(), kHloModuleName);
+    });
+  });
+}
+
+// Checks that HLO module events are expanded, with both same name and scope
+// range id. Note that strange XStatValue{int64_t{10}} is to handle different
+// compilers behavior.
+TEST(DerivedTimelineTest, HloModuleNameSameScopeRangeIdTest) {
+  const absl::string_view kHloModuleName = "hlo_module";
+  const absl::string_view kKernelDetails = "kernel_details";
+  XSpace space;
+  tsl::profiler::GroupMetadataMap group_metadata_map;
+  XPlane* plane = GetOrCreateGpuXPlane(&space, /*device_ordinal=*/0);
+  XPlaneBuilder plane_builder(plane);
+  auto line_builder = plane_builder.GetOrCreateLine(0);
+  CreateXEvent(&plane_builder, &line_builder, "op1", 0, 100,
+               {{StatType::kHloModule, XStatValue{kHloModuleName}},
+                {StatType::kKernelDetails, XStatValue{kKernelDetails}},
+                {StatType::kScopeRangeId, XStatValue{int64_t{10}}}});
+  CreateXEvent(&plane_builder, &line_builder, "op2", 200, 300,
+               {{StatType::kHloModule, XStatValue{kHloModuleName}},
+                {StatType::kKernelDetails, XStatValue{kKernelDetails}},
+                {StatType::kScopeRangeId, XStatValue{int64_t{10}}}});
+  GenerateDerivedTimeLines(group_metadata_map, &space);
+  XPlaneVisitor plane_visitor = tsl::profiler::CreateTfXPlaneVisitor(plane);
+  // Only the hlo module line is added and other empty lines are removed at the
+  // end.
+  EXPECT_EQ(plane_visitor.NumLines(), 2);
+  plane_visitor.ForEachLine([&](const XLineVisitor& line_visitor) {
+    if (line_visitor.Id() == 0) return;
+    EXPECT_EQ(line_visitor.Id(), kThreadIdHloModule);
+    EXPECT_EQ(line_visitor.NumEvents(), 1);
+    line_visitor.ForEachEvent([&](const XEventVisitor& event_visitor) {
+      EXPECT_EQ(event_visitor.Name(), kHloModuleName);
+    });
+  });
+}
+
+// Checks that HLO module events are expanded, with same name only,
+// but different scope range id.
+TEST(DerivedTimelineTest, HloModuleNameDifferentScopeRangeIdTest) {
+  const absl::string_view kHloModuleName = "hlo_module";
+  const absl::string_view kKernelDetails = "kernel_details";
+  XSpace space;
+  tsl::profiler::GroupMetadataMap group_metadata_map;
+  XPlane* plane = GetOrCreateGpuXPlane(&space, /*device_ordinal=*/0);
+  XPlaneBuilder plane_builder(plane);
+  auto line_builder = plane_builder.GetOrCreateLine(0);
+  CreateXEvent(&plane_builder, &line_builder, "op1", 0, 100,
+               {{StatType::kHloModule, XStatValue{kHloModuleName}},
+                {StatType::kKernelDetails, XStatValue{kKernelDetails}},
+                {StatType::kScopeRangeId, XStatValue{int64_t{10}}}});
+  CreateXEvent(&plane_builder, &line_builder, "op2", 200, 300,
+               {{StatType::kHloModule, XStatValue{kHloModuleName}},
+                {StatType::kKernelDetails, XStatValue{kKernelDetails}},
+                {StatType::kScopeRangeId, XStatValue{int64_t{20}}}});
+  GenerateDerivedTimeLines(group_metadata_map, &space);
+  XPlaneVisitor plane_visitor = tsl::profiler::CreateTfXPlaneVisitor(plane);
+  // Only the hlo module line is added and other empty lines are removed at the
+  // end.
+  EXPECT_EQ(plane_visitor.NumLines(), 2);
+  plane_visitor.ForEachLine([&](const XLineVisitor& line_visitor) {
+    if (line_visitor.Id() == 0) return;
+    EXPECT_EQ(line_visitor.Id(), kThreadIdHloModule);
+    EXPECT_EQ(line_visitor.NumEvents(), 2);
     line_visitor.ForEachEvent([&](const XEventVisitor& event_visitor) {
       EXPECT_EQ(event_visitor.Name(), kHloModuleName);
     });
@@ -432,6 +500,40 @@ TEST(DerivedTimelineTest, DeriveLinesForXlaCpuOps) {
       } else {
         FAIL() << "Found Event " << event_visitor.Name();
       }
+    });
+  });
+}
+
+TEST(DerivedTimelineTest, MergeAndNoMerge) {
+  constexpr absl::string_view kHloModuleName = "Framework Ops";
+  static constexpr absl::string_view kTfOpName = "abc:model/layer/MatMul_1";
+  XSpace space;
+  tsl::profiler::GroupMetadataMap group_metadata_map;
+  XPlane* plane =
+      GetOrCreateTpuXPlane(&space, /*device_ordinal=*/0, "DummyTPU", 1.0, 1.0);
+  XPlaneBuilder plane_builder(plane);
+  auto line_builder = plane_builder.GetOrCreateLine(0);
+  CreateXEvent(
+      &plane_builder, &line_builder, "op1", 0, 100,
+      {{StatType::kHloModule, kHloModuleName}, {StatType::kTfOp, kTfOpName}});
+  CreateXEvent(
+      &plane_builder, &line_builder, "op2", 200, 300,
+      {{StatType::kHloModule, kHloModuleName}, {StatType::kTfOp, kTfOpName}});
+  // The above two events are merged into one. This event will not be merged
+  // because the gap is > 2x(0..200+300) = 1000.
+  CreateXEvent(
+      &plane_builder, &line_builder, "op3", 1501, 300,
+      {{StatType::kHloModule, kHloModuleName}, {StatType::kTfOp, kTfOpName}});
+  GenerateDerivedTimeLines(group_metadata_map, &space);
+  XPlaneVisitor plane_visitor = tsl::profiler::CreateTfXPlaneVisitor(plane);
+  // Only the hlo module line is added and other empty lines are removed at the
+  // end.
+  EXPECT_EQ(plane_visitor.NumLines(), 2);
+  plane_visitor.ForEachLine([](const XLineVisitor& line_visitor) {
+    if (line_visitor.Id() == 0) return;
+    EXPECT_EQ(line_visitor.NumEvents(), 2);
+    line_visitor.ForEachEvent([](const XEventVisitor& event_visitor) {
+      EXPECT_EQ(event_visitor.Name(), kTfOpName);
     });
   });
 }

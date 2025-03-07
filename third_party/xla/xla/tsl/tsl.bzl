@@ -23,7 +23,7 @@ load(
     "if_rocm",
 )
 load(
-    "@local_tsl//tsl/platform:rules_cc.bzl",
+    "//xla/tsl/platform:rules_cc.bzl",
     "cc_binary",
     "cc_library",
     "cc_shared_library",
@@ -33,15 +33,21 @@ load(
     "if_tensorrt",
 )
 load(
-    "@local_tsl//third_party/py/rules_pywrap:pywrap.bzl",
+    "@local_xla//third_party/py/rules_pywrap:pywrap.bzl",
     "use_pywrap_rules",
-    _pybind_extension = "pybind_extension",
+)
+load(
+    "//xla/tsl:package_groups.bzl",
+    "DEFAULT_LOAD_VISIBILITY",
+    "LEGACY_TSL_TSL_USERS",
 )
 
 # Internally this loads a macro, but in OSS this is a function
 # buildifier: disable=out-of-order-load
 def register_extension_info(**_kwargs):
     pass
+
+visibility(DEFAULT_LOAD_VISIBILITY + LEGACY_TSL_TSL_USERS)
 
 two_gpu_tags = ["requires-gpu-nvidia:2", "notap", "manual", "no_pip"]
 
@@ -543,7 +549,7 @@ def cc_header_only_library(name, deps = [], includes = [], extra_deps = [], comp
 #
 # For:
 #   * Eigen: it's a header-only library.  Add it directly to your deps.
-#   * GRPC: add a direct dep on @com_github_grpc_grpc//:grpc++_public_hdrs.
+#   * GRPC: add a direct dep on @com_github_grpc_grpc//:grpc++.
 #
 def custom_op_cc_header_only_library(name, deps = [], includes = [], extra_deps = [], compatible_with = None, **kwargs):
     _transitive_hdrs(
@@ -838,4 +844,4 @@ def tsl_extra_config_settings_targets():
     return []
 
 # TODO(b/356020232): remove after migration is done
-tsl_pybind_extension = _pybind_extension if use_pywrap_rules() else tsl_pybind_extension_opensource
+tsl_pybind_extension = tsl_pybind_extension_opensource

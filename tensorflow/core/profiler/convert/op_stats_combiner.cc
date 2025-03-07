@@ -20,6 +20,7 @@ limitations under the License.
 #include <vector>
 
 #include "absl/container/flat_hash_map.h"
+#include "tensorflow/core/platform/types.h"
 #include "tensorflow/core/profiler/convert/op_metrics_db_combiner.h"
 #include "tensorflow/core/profiler/convert/xplane_to_tf_functions.h"
 #include "tensorflow/core/profiler/protobuf/diagnostics.pb.h"
@@ -117,6 +118,11 @@ void CombineRunEnvironment(const RunEnvironment& src, RunEnvironment* dst) {
     *dst->mutable_system_topology() = src.system_topology();
   } else if (dst->device_type().empty()) {
     dst->set_device_type(src.device_type());
+  }
+  if (src.hardware_type() != dst->hardware_type()) {
+    // Select the highest hardware type as TPU/GPU should override CPU_ONLY
+    // (e.g. coordinator).
+    dst->set_hardware_type(std::max(src.hardware_type(), dst->hardware_type()));
   }
   dst->set_task_count(src.task_count() + dst->task_count());
   // Only overwrite the dst if profile_duration_ms in dst is not defined or

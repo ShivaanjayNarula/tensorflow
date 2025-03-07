@@ -22,13 +22,13 @@ limitations under the License.
 #include "xla/hlo/ir/hlo_instructions.h"
 #include "xla/hlo/ir/hlo_module.h"
 #include "xla/hlo/ir/hlo_opcode.h"
+#include "xla/hlo/testlib/filecheck.h"
 #include "xla/hlo/utils/hlo_matchers.h"
 #include "xla/literal.h"
 #include "xla/service/hlo_runner.h"
 #include "xla/shape_util.h"
 #include "xla/test.h"
 #include "xla/test_helpers.h"
-#include "xla/tests/filecheck.h"
 #include "xla/tests/hlo_test_base.h"
 #include "xla/tsl/lib/core/status_test_util.h"
 #include "xla/xla_data.pb.h"
@@ -1227,7 +1227,7 @@ TEST_F(DynamicDimensionInferenceTest, InfersCustomOp) {
     CHECK(inference != nullptr);
     CHECK(Cast<HloCustomCallInstruction>(hlo) != nullptr);
     handler_called = true;
-    return absl::OkStatus();
+    return hlo->IsCustomCall("MyCustomOp");
   };
   TF_ASSERT_OK(RunInference(/*op_supports_dynamism_handler=*/nullptr, handler));
 

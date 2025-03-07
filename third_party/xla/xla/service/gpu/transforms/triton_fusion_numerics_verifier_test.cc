@@ -46,8 +46,6 @@ class TritonFusionNumericsVerifierTest
  public:
   DebugOptions GetDebugOptionsForTest() const override {
     auto options = HloTestBase::GetDebugOptionsForTest();
-    options.set_xla_gpu_experimental_enable_triton_softmax_priority_fusion(
-        true);
     options.set_xla_gpu_verify_triton_fusion_numerics(true);
     return options;
   }
@@ -84,11 +82,10 @@ class TritonFusionNumericsVerifierTest
   }
 
   AutotunerCompileUtil CreateAutotunerCompileUtil(AutotuneConfig& config) {
-    auto opt_compile_util_or =
+    auto compile_util_or =
         AutotunerCompileUtil::Create(config, GetDebugOptionsForTest());
-    TF_EXPECT_OK(opt_compile_util_or);
-    EXPECT_TRUE(opt_compile_util_or->has_value());
-    return std::move(opt_compile_util_or->value());
+    TF_EXPECT_OK(compile_util_or);
+    return std::move(compile_util_or).value();
   }
 };
 
@@ -122,7 +119,7 @@ ENTRY main{
     calls=triton_softmax_computation,
     backend_config={"operation_queue_id":"0","wait_on_operation_queues":[],
     "fusion_backend_config":{"kind":"__triton","block_level_fusion_config":
-    {"output_tile_sizes":["1","125"],"num_warps":"1"}},"force_earliest_schedule":false}
+    {"output_tiles":[{"sizes":["1","125"]}],"num_warps":"1"}},"force_earliest_schedule":false}
 }
 
 )";
@@ -211,7 +208,7 @@ ENTRY main {
     calls=triton_softmax_computation,
     backend_config={"fusion_backend_config":
       {"kind":"__triton","block_level_fusion_config":
-        {"output_tile_sizes":["1","256000"],"num_warps":"32"}}}
+        {"output_tiles":[{"sizes":["1","256000"]}],"num_warps":"32"}}}
 }
   )",
                        "");
@@ -276,9 +273,9 @@ ENTRY main {
   p0 = f32[16,16] parameter(0)
   p1 = f32[16,16] parameter(1)
   p2 = f32[16,16] parameter(2)
-  r0 = f32[16] fusion(p0), kind=kCustom, calls=reduce_0, backend_config={"fusion_backend_config": {"kind":"__triton","block_level_fusion_config":{"output_tile_sizes":["16"],"num_warps":"1"}}}
-  r1 = f32[16] fusion(p1), kind=kCustom, calls=reduce_1, backend_config={"fusion_backend_config": {"kind":"__triton","block_level_fusion_config":{"output_tile_sizes":["16"],"num_warps":"1"}}}
-  r2 = f32[16] fusion(p2), kind=kCustom, calls=reduce_2, backend_config={"fusion_backend_config": {"kind":"__triton","block_level_fusion_config":{"output_tile_sizes":["16"],"num_warps":"1"}}}
+  r0 = f32[16] fusion(p0), kind=kCustom, calls=reduce_0, backend_config={"fusion_backend_config": {"kind":"__triton","block_level_fusion_config":{"output_tiles":[{"sizes":["16"]}],"num_warps":"1"}}}
+  r1 = f32[16] fusion(p1), kind=kCustom, calls=reduce_1, backend_config={"fusion_backend_config": {"kind":"__triton","block_level_fusion_config":{"output_tiles":[{"sizes":["16"]}],"num_warps":"1"}}}
+  r2 = f32[16] fusion(p2), kind=kCustom, calls=reduce_2, backend_config={"fusion_backend_config": {"kind":"__triton","block_level_fusion_config":{"output_tiles":[{"sizes":["16"]}],"num_warps":"1"}}}
   add_0_1 = f32[16] add(r0, r1)
   ROOT add_0_2 = f32[16] add(add_0_1, r2)
 }
@@ -330,7 +327,7 @@ ENTRY main {
     calls=triton_softmax_computation,
     backend_config={"operation_queue_id":"0","wait_on_operation_queues":[],
       "fusion_backend_config":{"kind":"__triton","block_level_fusion_config":
-        {"output_tile_sizes":["1","1","1","16384"],"num_warps":"32"}},
+        {"output_tiles":[{"sizes":["1","1","1","16384"]}],"num_warps":"32"}},
         "force_earliest_schedule":false}
 }
   )";

@@ -19,6 +19,7 @@ limitations under the License.
 #include <cstdint>
 #include <iterator>
 #include <memory>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -37,7 +38,6 @@ limitations under the License.
 #include "xla/stream_executor/command_buffer.h"
 #include "xla/stream_executor/device_memory.h"
 #include "xla/stream_executor/gpu/gpu_command_buffer.h"
-#include "xla/stream_executor/gpu/gpu_stream.h"
 #include "xla/stream_executor/gpu/scoped_update_mode.h"
 #include "xla/stream_executor/kernel.h"
 #include "xla/stream_executor/launch_dim.h"
@@ -45,10 +45,10 @@ limitations under the License.
 #include "xla/stream_executor/rocm/rocm_kernel.h"
 #include "xla/stream_executor/rocm/rocm_status.h"
 #include "xla/stream_executor/stream_executor.h"
+#include "xla/tsl/platform/env.h"
+#include "xla/tsl/platform/errors.h"
+#include "xla/tsl/platform/statusor.h"
 #include "tsl/platform/casts.h"
-#include "tsl/platform/env.h"
-#include "tsl/platform/errors.h"
-#include "tsl/platform/statusor.h"
 
 namespace stream_executor::gpu {
 namespace {
@@ -122,7 +122,7 @@ absl::Status RocmCommandBuffer::LaunchSetIfElseConditionKernel(
 
 absl::Status RocmCommandBuffer::LaunchSetCaseConditionKernel(
     ExecutionScopeId execution_scope_id, GraphConditionalHandles conditionals,
-    DeviceMemory<int32_t> index, int32_t batch_offset,
+    DeviceMemory<uint8_t> index, bool index_is_bool, int32_t batch_offset,
     bool enable_conditional_default) {
   return absl::UnimplementedError("Conditionals are not supported on ROCM.");
 }
@@ -366,7 +366,8 @@ absl::Status RocmCommandBuffer::Trace(
   VLOG(5) << "Trace into GPU command buffer graph " << graph_
           << " on a stream: " << stream;
 
-  hipStream_t stream_handle = AsGpuStreamValue(stream);
+  hipStream_t stream_handle =
+      static_cast<hipStream_t>(stream->platform_specific_handle().stream);
 
   // Switch stream into the capture mode.
   uint64_t start_nanos = tsl::Env::Default()->NowNanos();
@@ -411,7 +412,9 @@ absl::Status RocmCommandBuffer::SetNodeExecutionEnabled(
 absl::Status RocmCommandBuffer::LaunchGraph(Stream* stream) {
   VLOG(3) << "Launch command buffer executable graph " << exec_
           << " on a stream: " << stream;
-  return ToStatus(wrap::hipGraphLaunch(exec_, AsGpuStreamValue(stream)),
+  return ToStatus(wrap::hipGraphLaunch(
+                      exec_, static_cast<hipStream_t>(
+                                 stream->platform_specific_handle().stream)),
                   "Failed to launch HIP graph");
 }
 absl::StatusOr<size_t> RocmCommandBuffer::GetNodeCount() const {
@@ -465,9 +468,9 @@ std::unique_ptr<ScopedUpdateMode> RocmCommandBuffer::ActivateUpdateMode(
 
 RocmCommandBuffer::~RocmCommandBuffer() {
   if (exec_ != nullptr && is_owned_graph_exec_) {
+    auto exec_num = NotifyExecDestroyed();
     VLOG(5) << "Destroy GPU command buffer executable graph " << exec_ << " "
-            << "(remaining alive executable graphs: " << NotifyExecDestroyed()
-            << ")";
+            << "(remaining alive executable graphs: " << exec_num << ")";
     if (auto status = ToStatus(hipGraphExecDestroy(exec_),
                                "Failed to destroy HIP executable graph");
         !status.ok()) {

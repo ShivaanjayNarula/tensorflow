@@ -1,7 +1,8 @@
+# Tensor Standard Libraries - common utilities for implementing XLA.
+
 load("@bazel_skylib//:bzl_library.bzl", "bzl_library")
 load("@bazel_skylib//lib:selects.bzl", "selects")
 load("@bazel_skylib//rules:common_settings.bzl", "bool_flag", "bool_setting")
-load("@local_tsl//tsl/platform:rules_cc.bzl", "cc_library")
 load("//xla/tsl:package_groups.bzl", "tsl_package_groups")
 load("//xla/tsl:tsl.bzl", "if_google", "if_oss", "internal_visibility")
 load(
@@ -10,6 +11,7 @@ load(
     "tsl_extra_config_settings_targets",
     "tsl_google_bzl_deps",
 )
+load("//xla/tsl/platform:rules_cc.bzl", "cc_library")
 
 # copybara:uncomment package(default_applicable_licenses = ["//tensorflow:license"])
 
@@ -417,12 +419,6 @@ config_setting(
 )
 
 config_setting(
-    name = "with_numa_support",
-    define_values = {"with_numa_support": "true"},
-    visibility = ["//visibility:public"],
-)
-
-config_setting(
     name = "fuchsia",
     constraint_values = if_google(
         ["//third_party/bazel_platforms/os:fuchsia"],
@@ -489,6 +485,26 @@ selects.config_setting_group(
         ":linux_armhf",
     ] + tsl_extra_config_settings_targets(),
     visibility = ["//visibility:public"],
+)
+
+selects.config_setting_group(
+    name = "linux_any",
+    match_any = [
+        ":linux_aarch64",
+        ":linux_armhf",
+        ":linux_ppc64le",
+        ":linux_s390x",
+        ":linux_x86_64",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+# Enable NUMA on Linux platforms; hwloc does not work on Android
+selects.config_setting_group(
+    name = "with_numa_support",
+    match_any = [
+        ":linux_any",
+    ],
 )
 
 # TODO(jakeharmon): Remove equivalent from tensorflow/BUILD
@@ -560,14 +576,15 @@ bzl_library(
     srcs = ["tsl.bzl"],
     visibility = ["//visibility:public"],
     deps = [
+        ":package_groups_bzl",
         "//third_party/compute_library:build_defs_bzl",
         "//xla/tsl/mkl:build_defs_bzl",
+        "//xla/tsl/platform:rules_cc_bzl",
         "@bazel_skylib//lib:new_sets",
         "@local_config_cuda//cuda:build_defs_bzl",
         "@local_config_rocm//rocm:build_defs_bzl",
         "@local_config_tensorrt//:build_defs_bzl",
-        "@local_tsl//third_party/py/rules_pywrap:pywrap_bzl",
-        "@local_tsl//tsl/platform:rules_cc_bzl",
+        "@local_xla//third_party/py/rules_pywrap:pywrap_bzl",
     ],
 )
 
@@ -576,9 +593,16 @@ bzl_library(
     srcs = if_google(["tsl.google.bzl"]),
     visibility = ["//visibility:public"],
     deps = [
+        ":package_groups_bzl",
         ":tsl_bzl",
-        "@local_tsl//tsl/platform:build_config_root_bzl",
+        "//xla/tsl/platform:build_config_root_bzl",
     ] + tsl_google_bzl_deps(),
+)
+
+bzl_library(
+    name = "package_groups_bzl",
+    srcs = ["package_groups.bzl"],
+    visibility = ["//xla:__subpackages__"],
 )
 
 # copybara:comment_begin(oss-only)

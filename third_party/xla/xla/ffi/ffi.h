@@ -39,6 +39,7 @@ limitations under the License.
 #include "absl/base/nullability.h"
 #include "absl/base/optimization.h"
 #include "absl/status/status.h"
+#include "absl/strings/string_view.h"
 #include "absl/types/span.h"
 #include "xla/executable_run_options.h"
 #include "xla/ffi/api/c_api.h"
@@ -61,12 +62,14 @@ limitations under the License.
 namespace xla::ffi {
 
 // Type tags to bind parameters passed via execution context to FFI handler.
-struct Stream {};             // binds `se::Stream*`
-struct DeviceOrdinal {};      // binds `int32_t` with device ordinal
-struct Allocator {};          // binds `se::DeviceMemoryAllocator*`
-struct ScratchAllocator {};   // binds `se::OwningScratchAllocator`
-struct CalledComputation {};  // binds `HloComputation*`
-struct IntraOpThreadPool {};  // binds `const Eigen::ThreadPoolDevice*`
+struct Stream {};               // binds `se::Stream*`
+struct DeviceOrdinal {};        // binds `int32_t` with device ordinal
+struct Allocator {};            // binds `se::DeviceMemoryAllocator*`
+struct ScratchAllocator {};     // binds `se::OwningScratchAllocator`
+struct CalledComputation {};    // binds `HloComputation*`
+struct IntraOpThreadPool {};    // binds `const Eigen::ThreadPoolDevice*`
+struct FfiApi {};               // binds `const XLA_FFI_Api*`
+struct FfiExecutionContext {};  // binds `XLA_FFI_ExecutionContext*`
 
 template <typename T>
 struct PlatformStream {};  // binds a platform stream, e.g. `cudaStream_t`
@@ -403,6 +406,22 @@ XLA_FFI_REGISTER_ARRRAY_ATTR_DECODING(double, XLA_FFI_DataType_F64);
 
 #undef XLA_FFI_REGISTER_ARRRAY_ATTR_DECODING
 
+template <>
+struct AttrDecoding<absl::string_view> {
+  using Type = absl::string_view;
+  static std::optional<std::string_view> Decode(XLA_FFI_AttrType type,
+                                                void* attr,
+                                                DiagnosticEngine& diagnostic) {
+    if (XLA_FFI_PREDICT_FALSE(type != XLA_FFI_AttrType_STRING)) {
+      return diagnostic.Emit("Wrong attribute type: expected ")
+             << XLA_FFI_AttrType_STRING << " but got " << type;
+    }
+
+    auto* span = reinterpret_cast<XLA_FFI_ByteSpan*>(attr);
+    return std::string_view(span->ptr, span->len);
+  }
+};
+
 // A type tag to mark i64 attributes as pointers to `T`.
 template <typename T>
 struct Pointer {};
@@ -555,6 +574,28 @@ struct CtxDecoding<IntraOpThreadPool> {
   }
 };
 
+template <>
+struct CtxDecoding<FfiApi> {
+  using Type = const XLA_FFI_Api*;
+
+  static std::optional<Type> Decode(const XLA_FFI_Api* api,
+                                    XLA_FFI_ExecutionContext* ctx,
+                                    DiagnosticEngine&) {
+    return api;
+  }
+};
+
+template <>
+struct CtxDecoding<FfiExecutionContext> {
+  using Type = XLA_FFI_ExecutionContext*;
+
+  static std::optional<Type> Decode(const XLA_FFI_Api* api,
+                                    XLA_FFI_ExecutionContext* ctx,
+                                    DiagnosticEngine&) {
+    return ctx;
+  }
+};
+
 template <typename T>
 struct CtxDecoding<PlatformStream<T>> {
   using Type = T;
@@ -568,6 +609,17 @@ struct CtxDecoding<PlatformStream<T>> {
           stream.value()->platform_specific_handle().stream);
     }
     return std::nullopt;
+  }
+};
+
+template <>
+struct CtxDecoding<RunId> {
+  using Type = RunId;
+
+  static std::optional<Type> Decode(const XLA_FFI_Api* api,
+                                    XLA_FFI_ExecutionContext* ctx,
+                                    DiagnosticEngine& diagnostic) {
+    return RunId{api->internal_api->XLA_FFI_INTERNAL_RunId_Get(ctx)};
   }
 };
 

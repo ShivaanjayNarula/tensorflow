@@ -22,6 +22,7 @@ limitations under the License.
 #include <variant>
 #include <vector>
 
+#include "absl/log/check.h"
 #include "absl/strings/string_view.h"
 #include "absl/types/span.h"
 #include "llvm/IR/Constants.h"
@@ -41,10 +42,10 @@ limitations under the License.
 #include "xla/service/llvm_ir/llvm_util.h"
 #include "xla/shape.h"
 #include "xla/shape_util.h"
+#include "xla/tsl/platform/logging.h"
+#include "xla/tsl/platform/status.h"
 #include "xla/util.h"
 #include "xla/xla_data.pb.h"
-#include "tsl/platform/logging.h"
-#include "tsl/platform/status.h"
 
 namespace xla {
 namespace llvm_ir {
@@ -198,7 +199,7 @@ IrArray::IrArray(llvm::Value* base_ptr, llvm::Type* pointee_type, Shape shape)
     : base_ptr_(base_ptr),
       pointee_type_(pointee_type),
       shape_(std::move(shape)) {
-  TF_CHECK_OK(ShapeUtil::ValidateShape(shape));
+  TF_CHECK_OK(ShapeUtil::ValidateShape(shape_));
   CHECK(base_ptr_->getType()->isPointerTy());
   int depth = 0;
   element_type_ = pointee_type;
@@ -211,7 +212,7 @@ IrArray::IrArray(llvm::Value* base_ptr, llvm::Type* pointee_type, Shape shape)
   if (!shape_.IsArray() || ShapeUtil::IsScalar(shape_)) {
     DCHECK(depth == 1 || depth == 0) << depth;
   } else {
-    DCHECK_EQ(depth, shape_.rank()) << shape.ShortDebugString();
+    DCHECK_EQ(depth, shape_.rank()) << shape_.ShortDebugString();
   }
 }
 
@@ -503,8 +504,7 @@ llvm::Value* IrArray::EmitArrayElementAddress(const IrArray::Index& index,
   if (ShapeUtil::IsScalar(shape_)) {
     if (primitive_util::IsSubByteNonPredType(shape_.element_type())) {
       CHECK_NE(bit_offset, nullptr);
-      *bit_offset =
-          b->getInt8(8 - primitive_util::BitWidth(shape_.element_type()));
+      *bit_offset = b->getInt8(0);
     }
     // Special handling of scalars: a scalar pretends to have the same value for
     // every index, thus effectively implementing broadcasting of its value
@@ -567,8 +567,8 @@ llvm::Value* IrArray::EmitLinearArrayElementAddress(
     const IrArray::Index& index, llvm::IRBuilderBase* b, absl::string_view name,
     llvm::Value** bit_offset) const {
   CHECK(index.LinearValidOnShape(shape_));
-  llvm::Module* module = b->GetInsertBlock()->getParent()->getParent();
-  llvm::Type* type = PrimitiveTypeToIrType(shape_.element_type(), module);
+  llvm::Type* type =
+      PrimitiveTypeToIrType(shape_.element_type(), b->getContext());
   if (!primitive_util::IsSubByteNonPredType(shape_.element_type())) {
     auto linear_index = llvm::dyn_cast<llvm::BinaryOperator>(index.linear());
     if (linear_index && (linear_index->getOpcode() == llvm::Instruction::Add)) {
@@ -597,9 +597,7 @@ llvm::Value* IrArray::EmitLinearArrayElementAddress(
 
   CHECK_NE(bit_offset, nullptr);
   *bit_offset = b->CreateIntCast(
-      b->CreateSub(llvm::ConstantInt::get(index_type, 8 - bit_width),
-                   b->CreateMul(remainder,
-                                llvm::ConstantInt::get(index_type, bit_width))),
+      b->CreateMul(remainder, llvm::ConstantInt::get(index_type, bit_width)),
       b->getInt8Ty(), /*isSigned=*/false);
   return b->CreateInBoundsGEP(b->getInt8Ty(), base_ptr_, byte_offset,
                               llvm_ir::AsStringRef(name));
@@ -671,8 +669,7 @@ IrArray IrArray::CastToShape(const Shape& new_shape,
                              llvm::IRBuilderBase* b) const {
   if (shape_ == new_shape) return *this;
 
-  llvm::Module* module = b->GetInsertBlock()->getParent()->getParent();
-  llvm::Type* new_ir_type = llvm_ir::ShapeToIrType(new_shape, module);
+  llvm::Type* new_ir_type = llvm_ir::ShapeToIrType(new_shape, b->getContext());
   IrArray new_irarray(base_ptr_, new_ir_type, new_shape);
   new_irarray.metadata_ = metadata_;
   return new_irarray;

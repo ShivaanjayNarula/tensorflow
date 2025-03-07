@@ -21,7 +21,6 @@ limitations under the License.
 #include <cstdint>
 #include <memory>
 #include <string>
-#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -32,12 +31,12 @@ limitations under the License.
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_format.h"
+#include "absl/strings/string_view.h"
 #include "absl/types/span.h"
 #include "xla/stream_executor/bit_pattern.h"
 #include "xla/stream_executor/command_buffer.h"
 #include "xla/stream_executor/cuda/cuda_platform_id.h"
 #include "xla/stream_executor/device_memory.h"
-#include "xla/stream_executor/gpu/gpu_executor.h"
 #include "xla/stream_executor/kernel.h"
 #include "xla/stream_executor/kernel_spec.h"
 #include "xla/stream_executor/launch_dim.h"
@@ -62,7 +61,7 @@ using GraphConditionalHandle = GpuCommandBuffer::GraphConditionalHandle;
 using GraphConditionalHandles = absl::Span<const GraphConditionalHandle>;
 
 namespace {
-std::string_view to_string(State state) {
+absl::string_view to_string(State state) {
   switch (state) {
     case State::kCreate:
       return "create";
@@ -106,7 +105,7 @@ static std::atomic<int64_t> alive_execs(0);
 
 GpuCommandBuffer::GpuCommandBuffer(Mode mode, StreamExecutor* parent)
     : mode_(mode), parent_(parent) {
-  execution_scopes_.try_emplace(kDefaulExecutionScope);
+  execution_scopes_.try_emplace(kDefaultExecutionScope);
 }
 
 GpuCommandBuffer::Dependencies GpuCommandBuffer::GetBarrier(
@@ -119,7 +118,7 @@ GpuCommandBuffer::Dependencies GpuCommandBuffer::GetBarrier(
 
 absl::Status GpuCommandBuffer::DisableBarriersExecution(
     GpuCommandBuffer& root_command_buffer) {
-  ExecutionScope& execution_scope = execution_scopes_[kDefaulExecutionScope];
+  ExecutionScope& execution_scope = execution_scopes_[kDefaultExecutionScope];
 
   for (GpuGraphBarrierInfo& barrier : execution_scope.barriers) {
     if (barrier.is_barrier_node) {
@@ -608,7 +607,8 @@ absl::Status GpuCommandBuffer::IfElse(ExecutionScopeId execution_scope_id,
 }
 
 absl::Status GpuCommandBuffer::Case(ExecutionScopeId execution_scope_id,
-                                    DeviceMemory<int32_t> index,
+                                    DeviceMemory<uint8_t> index,
+                                    bool index_is_bool,
                                     std::vector<Builder> branches) {
   constexpr size_t kBranchBatchSize = 8;
   int32_t batch_offset = 0;
@@ -632,7 +632,8 @@ absl::Status GpuCommandBuffer::Case(ExecutionScopeId execution_scope_id,
     auto set_cond_fn = [&, batch_offset, enable_conditional_default](
                            ExecutionScopeId id,
                            GraphConditionalHandles conditionals) {
-      return LaunchSetCaseConditionKernel(id, conditionals, index, batch_offset,
+      return LaunchSetCaseConditionKernel(id, conditionals, index,
+                                          index_is_bool, batch_offset,
                                           enable_conditional_default);
     };
 
@@ -650,6 +651,24 @@ absl::Status GpuCommandBuffer::Case(ExecutionScopeId execution_scope_id,
     batch_offset += batch_size;
   }
   return absl::OkStatus();
+}
+
+absl::Status GpuCommandBuffer::Case(ExecutionScopeId execution_scope_id,
+                                    DeviceMemory<bool> index,
+                                    std::vector<Builder> branches) {
+  return Case(
+      execution_scope_id,
+      DeviceMemory<uint8_t>::MakeFromByteSize(index.opaque(), index.size()),
+      /*index_is_bool=*/true, branches);
+}
+
+absl::Status GpuCommandBuffer::Case(ExecutionScopeId execution_scope_id,
+                                    DeviceMemory<int32_t> index,
+                                    std::vector<Builder> branches) {
+  return Case(
+      execution_scope_id,
+      DeviceMemory<uint8_t>::MakeFromByteSize(index.opaque(), index.size()),
+      /*index_is_bool=*/false, branches);
 }
 
 absl::Status GpuCommandBuffer::For(ExecutionScopeId execution_scope_id,
@@ -670,8 +689,8 @@ absl::Status GpuCommandBuffer::For(ExecutionScopeId execution_scope_id,
     TF_RETURN_IF_ERROR(body->Barrier());
 
     // Decide if we want to continue loop iteration.
-    return body->LaunchSetForConditionKernel(kDefaulExecutionScope, conditional,
-                                             loop_counter, num_iteration);
+    return body->LaunchSetForConditionKernel(
+        kDefaultExecutionScope, conditional, loop_counter, num_iteration);
   };
 
   std::array<ConditionBuilder, 1> builders = {std::move(body)};
@@ -695,9 +714,9 @@ absl::Status GpuCommandBuffer::While(ExecutionScopeId execution_scope_id,
   auto body = [&](GpuCommandBuffer* body, GraphConditionalHandle conditional) {
     TF_RETURN_IF_ERROR(body_builder(body));
     TF_RETURN_IF_ERROR(body->Barrier());
-    TF_RETURN_IF_ERROR(cond_builder(kDefaulExecutionScope, body));
+    TF_RETURN_IF_ERROR(cond_builder(kDefaultExecutionScope, body));
     TF_RETURN_IF_ERROR(body->Barrier());
-    return body->LaunchSetWhileConditionKernel(kDefaulExecutionScope,
+    return body->LaunchSetWhileConditionKernel(kDefaultExecutionScope,
                                                conditional, pred);
   };
 
@@ -752,8 +771,9 @@ absl::Status GpuCommandBuffer::Finalize() {
 
     uint64_t end_nanos = tsl::Env::Default()->NowNanos();
 
-    VLOG(5) << "Instantiated executable graph #" << NotifyExecCreated()
-            << " in " << (end_nanos - start_nanos) / 1000 << " μs"
+    auto exec_num = NotifyExecCreated();
+    VLOG(5) << "Instantiated executable graph #" << exec_num << " in "
+            << (end_nanos - start_nanos) / 1000 << " μs"
             << "; execution_scopes: " << execution_scopes_.size()
             << "; nodes: " << num_nodes
             << "; conditionals: " << num_cond_cmd_buffers

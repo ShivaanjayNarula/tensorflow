@@ -151,7 +151,7 @@ class PjRtArray final
     return sharding_;
   }
 
-  absl::StatusOr<std::unique_ptr<PjRtLayout>> layout() const override;
+  absl::StatusOr<std::shared_ptr<const PjRtLayout>> layout() const override;
 
   absl::StatusOr<std::vector<tsl::RCReference<Array>>>
   DisassembleIntoSingleDeviceArrays(ArrayCopySemantics semantics) override;
@@ -166,7 +166,7 @@ class PjRtArray final
       ArrayCopySemantics semantics) override;
 
   absl::StatusOr<tsl::RCReference<Array>> Copy(
-      std::optional<tsl::RCReference<xla::ifrt::DeviceList>> devices,
+      std::optional<xla::ifrt::DeviceListRef> devices,
       std::optional<xla::ifrt::MemoryKind> memory_kind,
       ArrayCopySemantics semantics);
 

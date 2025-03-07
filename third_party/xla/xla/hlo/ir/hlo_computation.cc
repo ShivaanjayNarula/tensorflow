@@ -62,12 +62,12 @@ limitations under the License.
 #include "xla/shape_util.h"
 #include "xla/status_macros.h"
 #include "xla/tsl/lib/gtl/iterator_range.h"
+#include "xla/tsl/platform/errors.h"
+#include "xla/tsl/platform/logging.h"
+#include "xla/tsl/platform/status.h"
+#include "xla/tsl/platform/statusor.h"
 #include "xla/util.h"
 #include "xla/xla_data.pb.h"
-#include "tsl/platform/errors.h"
-#include "tsl/platform/logging.h"
-#include "tsl/platform/status.h"
-#include "tsl/platform/statusor.h"
 
 namespace xla {
 
@@ -258,6 +258,14 @@ HloInstruction* HloComputation::AddInstructionInternal(
   instruction_count_++;
   pinst->index_in_parent_ = index;
   instructions_.push_back(info);
+  for (HloComputation* called_computation : pinst->called_computations()) {
+    CHECK(called_computation);
+    // TODO(b/399394039): Consider enforcing that
+    // called_computation->parent() != nullptr.
+    CHECK(parent() == nullptr || called_computation->parent() == parent())
+        << "Called computation " << called_computation->name()
+        << " is not in the same module as " << name();
+  }
   return pinst;
 }
 
@@ -743,7 +751,12 @@ std::vector<HloInstruction*> HloComputation::MakeInstructionPostOrder(
   dfs_stack_scratch.reserve(instruction_count());
 
   for (const auto& instruction : instructions()) {
-    if (instruction->users().empty()) {
+    // We don't consider users outside any computation as real users. This can
+    // happen when creating new instructions for replacement when cloning
+    // computations.
+    if (absl::c_all_of(instruction->users(), [](const HloInstruction* user) {
+          return user->parent() == nullptr;
+        })) {
       ComputeInstructionPostOrder(instruction, channel_dependencies, visited,
                                   post_order, &dfs_stack_scratch);
     }
@@ -823,7 +836,12 @@ void HloComputation::ForEachInstructionPostOrder(
   dfs_stack_scratch.reserve(instruction_count());
   auto channel_dependencies = ComputeChannelDependencies();
   for (const auto& instruction : instructions()) {
-    if (instruction->users().empty()) {
+    // We don't consider users outside any computation as real users. This can
+    // happen when creating new instructions for replacement when cloning
+    // computations.
+    if (absl::c_all_of(instruction->users(), [](const HloInstruction* user) {
+          return user->parent() == nullptr;
+        })) {
       ForEachInstructionPostOrderImpl(func, instruction, channel_dependencies,
                                       visited, &dfs_stack_scratch);
     }
@@ -1728,7 +1746,7 @@ std::unique_ptr<HloComputation> HloComputation::CloneInContext(
       for (HloInstruction* operand : cur->operands()) {
         const HloInstruction* new_operand = replace(operand);
         if (new_operand) {
-          dfs_stack.emplace_back(new_operand);
+          dfs_stack.push_back(new_operand);
         }
       }
     }

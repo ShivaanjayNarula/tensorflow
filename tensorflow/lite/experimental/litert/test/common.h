@@ -25,40 +25,32 @@
 #include "tensorflow/lite/experimental/litert/core/util/flatbuffer_tools.h"
 #include "tensorflow/lite/interpreter.h"
 
-#define _LITERT_ASSERT_RESULT_OK_ASSIGN(decl, expr, result) \
-  auto result = (expr);                                     \
-  ASSERT_TRUE(result.HasValue());                           \
-  decl = result.Value();
-
-#define LITERT_ASSERT_RESULT_OK_ASSIGN(decl, expr) \
-  _LITERT_ASSERT_RESULT_OK_ASSIGN(decl, expr,      \
-                                  _CONCAT_NAME(_result, __COUNTER__))
-
-#define _LITERT_ASSERT_RESULT_OK_MOVE(decl, expr, result) \
-  auto result = (expr);                                   \
-  ASSERT_TRUE(result.HasValue());                         \
-  decl = std::move(result.Value());
-
-#define LITERT_ASSERT_RESULT_OK_MOVE(decl, expr) \
-  _LITERT_ASSERT_RESULT_OK_MOVE(decl, expr, _CONCAT_NAME(_result, __COUNTER__))
-
-#define LITERT_ASSERT_STATUS_HAS_CODE(expr, code) \
-  {                                               \
-    LiteRtStatus status = (expr);                 \
-    ASSERT_EQ(status, code);                      \
-  }
-
-#define LITERT_ASSERT_STATUS_OK(expr) \
-  LITERT_ASSERT_STATUS_HAS_CODE(expr, kLiteRtStatusOk);
-
 namespace litert {
 namespace testing {
 
+// A x-platform compatible replacement for testing::UniqueTestDirectory.
+class UniqueTestDirectory {
+ public:
+  static Expected<UniqueTestDirectory> Create();
+  ~UniqueTestDirectory();
+
+  UniqueTestDirectory(const UniqueTestDirectory&) = delete;
+  UniqueTestDirectory(UniqueTestDirectory&&) = default;
+  UniqueTestDirectory& operator=(const UniqueTestDirectory&) = delete;
+  UniqueTestDirectory& operator=(UniqueTestDirectory&&) = default;
+
+  absl::string_view Str() const { return tmpdir_; }
+
+ private:
+  explicit UniqueTestDirectory(std::string&& tmpdir)
+      : tmpdir_(std::move(tmpdir)) {}
+  std::string tmpdir_;
+};
+
 std::string GetTestFilePath(absl::string_view filename);
+std::string GetTfliteFilePath(absl::string_view filename);
 
 Model LoadTestFileModel(absl::string_view filename);
-
-bool ValidateTopology(const std::vector<Op>& ops);
 
 class TflRuntime {
  public:

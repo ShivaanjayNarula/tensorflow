@@ -30,11 +30,13 @@ limitations under the License.
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/flat_hash_set.h"
 #include "absl/strings/match.h"
+#include "absl/strings/numbers.h"
+#include "absl/strings/str_cat.h"
 #include "absl/strings/str_join.h"
 #include "absl/strings/str_split.h"
 #include "absl/strings/string_view.h"
-#include "absl/types/optional.h"
 #include "absl/types/span.h"
+#include "xla/tsl/platform/logging.h"
 #include "xla/tsl/profiler/utils/device_utils.h"
 #include "xla/tsl/profiler/utils/group_events.h"
 #include "xla/tsl/profiler/utils/tf_xplane_visitor.h"
@@ -44,11 +46,10 @@ limitations under the License.
 #include "xla/tsl/profiler/utils/xplane_visitor.h"
 #include "tensorflow/core/lib/gtl/map_util.h"
 #include "tensorflow/core/profiler/protobuf/inference_stats.pb.h"
-#include "tensorflow/core/profiler/protobuf/xplane.pb.h"
 #include "tensorflow/core/profiler/utils/event_span.h"
 #include "tensorflow/core/profiler/utils/xplane_schema.h"
-#include "tsl/platform/logging.h"
 #include "tsl/platform/protobuf.h"
+#include "tsl/profiler/protobuf/xplane.pb.h"
 
 namespace tensorflow {
 namespace profiler {
@@ -1197,7 +1198,7 @@ bool CompareByDuration(const DataType& a, const DataType& b) {
 void BuildRequestDetails(
     const RequestEventsMap& request_events_map, DeviceType device_type,
     const int32_t host_id,
-    proto2::RepeatedPtrField<tensorflow::profiler::RequestDetail>*
+    tsl::protobuf::RepeatedPtrField<tensorflow::profiler::RequestDetail>*
         request_details) {
   for (auto& [group_id, request_events] : request_events_map) {
     if (request_events.request_timespan.duration_ps() == 0) continue;
@@ -1213,7 +1214,7 @@ void BuildRequestDetails(
 
 void BuildBatchDetails(
     BatchEventsMap batch_events_map, const int32_t host_id,
-    proto2::RepeatedPtrField<tensorflow::profiler::BatchDetail>*
+    tsl::protobuf::RepeatedPtrField<tensorflow::profiler::BatchDetail>*
         batch_details) {
   for (auto& [group_id, batch_events] : batch_events_map) {
     batch_events.batch_detail_proto.set_host_id(host_id);
@@ -1283,7 +1284,7 @@ void ParseTfstreamzForBatchingParameter(
     } else if (absl::StartsWith(param_detail,
                                 kBatchingParamAllowedBatchSizes)) {
       model_params[model_id_tfstreamz].set_allowed_batch_sizes(
-          stat.StrOrRefValue());
+          std::string(stat.StrOrRefValue()));
     }
   });
 

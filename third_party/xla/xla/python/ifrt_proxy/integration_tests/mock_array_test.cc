@@ -37,6 +37,7 @@
 #include "xla/pjrt/plugin/xla_cpu/cpu_client_options.h"
 #include "xla/pjrt/plugin/xla_cpu/xla_cpu_pjrt_client.h"
 #include "xla/python/ifrt/array.h"
+#include "xla/python/ifrt/attribute_map.h"
 #include "xla/python/ifrt/client.h"
 #include "xla/python/ifrt/device.h"
 #include "xla/python/ifrt/dtype.h"
@@ -51,9 +52,9 @@
 #include "xla/python/ifrt_proxy/server/grpc_server.h"
 #include "xla/python/pjrt_ifrt/pjrt_client.h"
 #include "xla/tsl/concurrency/ref_count.h"
-#include "tsl/platform/status_matchers.h"
-#include "tsl/platform/statusor.h"
-#include "tsl/platform/test.h"
+#include "xla/tsl/platform/status_matchers.h"
+#include "xla/tsl/platform/statusor.h"
+#include "xla/tsl/platform/test.h"
 
 namespace xla {
 namespace ifrt {
@@ -74,7 +75,9 @@ class MockArrayTest : public testing::Test {
         absl::StrCat("localhost:", tsl::testing::PickUnusedPortOrDie());
     TF_ASSERT_OK_AND_ASSIGN(
         server_, GrpcServer::CreateFromIfrtClientFactory(
-                     address, [this] { return CreateMockBackend(); }));
+                     address, [this](AttributeMap initialization_data) {
+                       return CreateMockBackend();
+                     }));
     TF_ASSERT_OK_AND_ASSIGN(client_,
                             CreateClient(absl::StrCat("grpc://", address)));
   }

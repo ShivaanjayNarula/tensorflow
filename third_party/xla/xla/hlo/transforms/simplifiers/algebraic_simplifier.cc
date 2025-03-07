@@ -31,6 +31,7 @@ limitations under the License.
 #include <vector>
 
 #include "absl/algorithm/container.h"
+#include "absl/base/nullability.h"
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/flat_hash_set.h"
 #include "absl/container/inlined_vector.h"
@@ -2089,9 +2090,9 @@ absl::Status AlgebraicSimplifierVisitor::HandleConstant(
         LiteralUtil::GetFirstScalarLiteral(constant->literal()));
     HloInstruction* scalar = constant->AddInstruction(
         simplifier_->CreateConstantWithLayoutUpdated(std::move(unique_scalar)));
-    return ReplaceWithNewInstruction(
-        constant,
+    HloInstruction* broadcast = constant->AddInstruction(
         HloInstruction::CreateBroadcast(constant->shape(), scalar, {}));
+    return ReplaceInstruction(constant, broadcast);
   }
 
   // If a literal is an increasing sequence from zero, replace it with an iota.
@@ -3940,7 +3941,8 @@ absl::Status AlgebraicSimplifierVisitor::RewriteBatchPlusContractingAsReduce(
   }
 
   TF_ASSIGN_OR_RETURN(HloInstruction * new_dot,
-                      MakeBinaryHlo(HloOpcode::kMultiply, new_lhs, new_rhs));
+                      MakeMultiplyForPrecisionAlgorithm(dot, new_lhs, new_rhs));
+
   std::vector<int64_t> reduce_dims(dnums.lhs_contracting_dimensions_size());
   PrimitiveType dot_type =
       ShapeUtil::ElementIsFloating(dot->shape())
@@ -3952,6 +3954,19 @@ absl::Status AlgebraicSimplifierVisitor::RewriteBatchPlusContractingAsReduce(
   new_dot = AddReduce(new_dot, reduce_dims, dot_type);
   new_dot = AsType(new_dot, dot->shape().element_type());
   return ReplaceInstruction(dot, new_dot);
+}
+
+bool AlgebraicSimplifierVisitor::SupportedDotPrecisionConfig(
+    const PrecisionConfig& config) {
+  return config.algorithm() == PrecisionConfig::ALG_UNSET ||
+         // TODO(loislo): Fixes a failure on a test with CPU backend.
+         config.algorithm() == PrecisionConfig::ALG_DOT_F32_F32_F32;
+}
+
+absl::StatusOr<HloInstruction*>
+AlgebraicSimplifierVisitor::MakeMultiplyForPrecisionAlgorithm(
+    HloInstruction*, HloInstruction* lhs, HloInstruction* rhs) {
+  return MakeBinaryHlo(HloOpcode::kMultiply, lhs, rhs);
 }
 
 absl::Status AlgebraicSimplifierVisitor::HandleDot(HloInstruction* dot) {
@@ -3980,13 +3995,7 @@ absl::Status AlgebraicSimplifierVisitor::HandleDot(HloInstruction* dot) {
       absl::c_linear_search(dot->precision_config().operand_precision(),
                             PrecisionConfig::PACKED_NIBBLE);
   const bool can_rewrite_dot_with_precision_config_algorithm =
-      dot->precision_config().algorithm() == PrecisionConfig::ALG_UNSET ||
-      dot->precision_config().algorithm() ==
-          PrecisionConfig::ALG_DOT_BF16_BF16_F32_X3 ||
-      dot->precision_config().algorithm() ==
-          PrecisionConfig::ALG_DOT_BF16_BF16_F32_X6 ||
-      dot->precision_config().algorithm() ==
-          PrecisionConfig::ALG_DOT_F32_F32_F32;
+      SupportedDotPrecisionConfig(dot->precision_config());
   // If there are no contracting dimensions, a dot can be rewritten as
   // mul(broadcast(transpose(x)),broadcast(transpose(y)))
   if (!is_packed_nibble && can_rewrite_dot_with_precision_config_algorithm &&
@@ -4252,27 +4261,21 @@ absl::Status AlgebraicSimplifierVisitor::HandleGather(HloInstruction* gather) {
     return ReplaceInstruction(gather, result);
   }
 
-  const auto gather_operand_passthrough_operand_dims =
-      hlo_sharding_util::GetGatherOperandPassthroughOperandDims(
-          gather->operand(0)->shape(), *gather, gather->gather_slice_sizes());
-  const auto gather_operand_passthrough_output_dims =
-      hlo_sharding_util::GetGatherOperandPassthroughOutputDims(
-          gather->shape(), gather->operand(0)->shape(), *gather,
-          gather->gather_slice_sizes());
+  const hlo_sharding_util::GatherScatterDims operand_passthrough_dims =
+      hlo_sharding_util::GetGatherOperandPassthroughDims(
+          *gather, gather->gather_slice_sizes());
+
   absl::flat_hash_map<int64_t, int64_t>
       gather_operand_passthrough_operand_to_output_dims;
   absl::flat_hash_map<int64_t, int64_t>
       gather_operand_passthrough_output_to_operand_dims;
-  CHECK_EQ(gather_operand_passthrough_operand_dims.size(),
-           gather_operand_passthrough_output_dims.size());
-  for (int64_t i = 0; i != gather_operand_passthrough_operand_dims.size();
-       ++i) {
-    gather_operand_passthrough_operand_to_output_dims
-        [gather_operand_passthrough_operand_dims[i]] =
-            gather_operand_passthrough_output_dims[i];
-    gather_operand_passthrough_output_to_operand_dims
-        [gather_operand_passthrough_output_dims[i]] =
-            gather_operand_passthrough_operand_dims[i];
+  CHECK_EQ(operand_passthrough_dims.operand_dims.size(),
+           operand_passthrough_dims.output_dims.size());
+  for (int64_t i = 0; i != operand_passthrough_dims.operand_dims.size(); ++i) {
+    int64_t operand_dim = operand_passthrough_dims.operand_dims[i];
+    int64_t output_dim = operand_passthrough_dims.output_dims[i];
+    gather_operand_passthrough_operand_to_output_dims[operand_dim] = output_dim;
+    gather_operand_passthrough_output_to_operand_dims[output_dim] = operand_dim;
   }
   // If the gather operand is a pad on the pass-through dimensions, then we can
   // gather the unpadded operand and then pad.
@@ -4505,11 +4508,16 @@ absl::Status AlgebraicSimplifierVisitor::HandleMaximum(
   if (primitive_util::IsIntegralType(ty) ||
       (primitive_util::IsFloatingPointType(ty) &&
        options_.minmax_propagate_nan())) {
-    Literal min_val = LiteralUtil::MinValue(ty);
-    if (IsAll(lhs, min_val)) {
+    // Note that `lhs` and `rhs` can have a different element type than
+    // `maximum` if we are dealing with floating point types.
+    PrimitiveType lhs_ty = lhs->shape().element_type();
+    PrimitiveType rhs_ty = rhs->shape().element_type();
+    Literal min_val_lhs = LiteralUtil::MinValue(lhs_ty);
+    if (rhs_ty == ty && IsAll(lhs, min_val_lhs)) {
       return ReplaceInstruction(maximum, rhs);
     }
-    if (IsAll(rhs, min_val)) {
+    Literal min_val_rhs = LiteralUtil::MinValue(rhs_ty);
+    if (lhs_ty == ty && IsAll(rhs, min_val_rhs)) {
       return ReplaceInstruction(maximum, lhs);
     }
   }
@@ -4610,11 +4618,16 @@ absl::Status AlgebraicSimplifierVisitor::HandleMinimum(
   if (primitive_util::IsIntegralType(ty) ||
       (primitive_util::IsFloatingPointType(ty) &&
        options_.minmax_propagate_nan())) {
-    Literal max_val = LiteralUtil::MaxValue(ty);
-    if (IsAll(lhs, max_val)) {
+    // Note that `lhs` and `rhs` can have a different element type than
+    // `minimum` if we are dealing with floating point types.
+    PrimitiveType lhs_ty = lhs->shape().element_type();
+    PrimitiveType rhs_ty = rhs->shape().element_type();
+    Literal max_val_lhs = LiteralUtil::MaxValue(lhs_ty);
+    if (rhs_ty == ty && IsAll(lhs, max_val_lhs)) {
       return ReplaceInstruction(minimum, rhs);
     }
-    if (IsAll(rhs, max_val)) {
+    Literal max_val_rhs = LiteralUtil::MaxValue(rhs_ty);
+    if (lhs_ty == ty && IsAll(rhs, max_val_rhs)) {
       return ReplaceInstruction(minimum, lhs);
     }
   }
@@ -5238,11 +5251,8 @@ absl::Status AlgebraicSimplifierVisitor::HandleBroadcast(
   }
 
   if (options_.enable_sink_broadcast()) {
-    // A Broadcast that feeds a unary element-wise operation can sink the
-    // broadcast after the unary element-wise operation.
-    TF_ASSIGN_OR_RETURN(
-        bool sink_succeeded,
-        TryToSinkBroadcastAfterOpWithUniqueNonScalarOperand(broadcast));
+    TF_ASSIGN_OR_RETURN(bool sink_succeeded,
+                        TryToSinkBroadcastAfterElementwiseOps(broadcast));
     if (sink_succeeded) {
       MarkAsChanged();
       return absl::OkStatus();
@@ -5747,6 +5757,10 @@ absl::Status AlgebraicSimplifierVisitor::HandlePad(HloInstruction* pad) {
     TF_ASSIGN_OR_RETURN(HloInstruction * nonzero_pad,
                         MakePadHlo(pad->mutable_operand(0),
                                    pad->mutable_operand(1), nonzero_padding));
+    // MakePadHlo assumes that the return type matches the type of the operand,
+    // but that's not required. Use the type from the original pad instruction.
+    nonzero_pad->mutable_shape()->set_element_type(pad->shape().element_type());
+
     // Copy the layout from the original pad instructions. The new pad and the
     // slice instruction should all have the same layout.
     TF_RETURN_IF_ERROR(LayoutUtil::CopyLayoutBetweenShapes(
@@ -5853,13 +5867,14 @@ absl::Status AlgebraicSimplifierVisitor::HandlePower(HloInstruction* power) {
 }
 
 absl::StatusOr<bool>
-AlgebraicSimplifierVisitor::TryToSinkBroadcastAfterOpWithUniqueNonScalarOperand(
+AlgebraicSimplifierVisitor::TryToSinkBroadcastAfterElementwiseOps(
     HloInstruction* broadcast) {
   TF_RET_CHECK(broadcast->opcode() == HloOpcode::kBroadcast);
   bool changed = false;
   if (ShapeUtil::IsScalar(broadcast->shape())) {
     return false;
   }
+
   HloInstruction* operand = broadcast->mutable_operand(0);
   auto is_scalar_broadcast = [](const HloInstruction* instruction) {
     return instruction->opcode() == HloOpcode::kBroadcast &&
@@ -5875,6 +5890,7 @@ AlgebraicSimplifierVisitor::TryToSinkBroadcastAfterOpWithUniqueNonScalarOperand(
   auto is_compatible_broadcast = [&](const HloInstruction* instruction) {
     return is_scalar_broadcast(instruction) || is_equal_broadcast(instruction);
   };
+
   for (HloInstruction* user : broadcast->users()) {
     if (user->IsDead()) {
       continue;
@@ -5892,53 +5908,34 @@ AlgebraicSimplifierVisitor::TryToSinkBroadcastAfterOpWithUniqueNonScalarOperand(
     if (!user->IsElementwise()) {
       continue;
     }
-
-    // Check if all the operands of the user are compatible broadcasts for
-    // sinking. (They are either scalar broadcasts or broadcasts casting
-    // from/to the same shape/dimensions)
-    int64_t compatible_broadcast_count = 0;
-    int64_t broadcast_use_count = 0;
-    for (HloInstruction* user_operand : user->operands()) {
-      if (is_compatible_broadcast(user_operand)) {
-        ++compatible_broadcast_count;
-      } else if (broadcast == user_operand) {
-        ++broadcast_use_count;
-      }
-    }
-    if (compatible_broadcast_count + broadcast_use_count !=
-        user->operand_count()) {
+    if (!absl::c_all_of(user->operands(), is_compatible_broadcast)) {
       continue;
     }
+
     std::vector<HloInstruction*> new_operands;
     new_operands.reserve(user->operand_count());
 
     Shape changed_shape;
     for (HloInstruction* user_operand : user->operands()) {
-      // If this is a broadcast operand that is not our original broadcast input
-      // to this function then we might need to change the input.
-      if (is_compatible_broadcast(user_operand)) {
+      if (is_scalar_broadcast(user_operand)) {
         // If this is a broadcast from a scalar value rewrite a broadcast from
         // the scalar to the new shape enforced from the other broadcast
         // operands.
-        if (is_scalar_broadcast(user_operand)) {
-          changed_shape = ShapeUtil::ChangeElementType(
-              operand->shape(), user_operand->shape().element_type());
-          simplifier_->UpdateLayout(&changed_shape);
-          new_operands.push_back(
-              user_operand->AddInstruction(HloInstruction::CreateBroadcast(
-                  changed_shape, user_operand->mutable_operand(0), {})));
-        } else {
-          // For the non-scalar broadcasts we guarantee that the shape of the
-          // operand of the broadcast needs to be already a compatible shape.
-          new_operands.push_back(user_operand->mutable_operand(0));
-        }
+        changed_shape = ShapeUtil::ChangeElementType(
+            operand->shape(), user_operand->shape().element_type());
+        simplifier_->UpdateLayout(&changed_shape);
+        new_operands.push_back(
+            user_operand->AddInstruction(HloInstruction::CreateBroadcast(
+                changed_shape, user_operand->mutable_operand(0), {})));
       } else {
-        CHECK_EQ(broadcast, user_operand);
-        new_operands.push_back(operand);
+        // For the non-scalar broadcasts, it is guaranteed that the shape of the
+        // operand of the broadcast is a compatible shape.
+        new_operands.push_back(user_operand->mutable_operand(0));
       }
     }
-    VLOG(4) << "Sinking broadcast after user:" << "\n  old broadcast: "
-            << broadcast->ToString() << "\n  old user: " << user->ToString();
+    VLOG(4) << "Sinking broadcast after user:"
+            << "\n  old broadcast: " << broadcast->ToString()
+            << "\n  old user: " << user->ToString();
     changed_shape = ShapeUtil::ChangeElementType(operand->shape(),
                                                  user->shape().element_type());
     simplifier_->UpdateLayout(&changed_shape);
@@ -6181,6 +6178,18 @@ absl::Status AlgebraicSimplifierVisitor::HandleReshape(
               // Both reshapes are hardware bitcast.
               // Still can put two copies next to each other for a merge.
               should_rewrite = true;
+            }
+          }
+
+          if (should_rewrite) {
+            // If the "before copy" is from host memory, we cannot do this
+            // rewrite.
+            HloInstruction* copy_before_operand =
+                copy_before->mutable_operand(0);
+            if (copy_before_operand->shape().has_layout() &&
+                copy_before_operand->shape().layout().memory_space() ==
+                    Layout::kHostMemorySpace) {
+              should_rewrite = false;
             }
           }
 
@@ -6633,6 +6642,45 @@ absl::StatusOr<bool> AlgebraicSimplifierVisitor::TryToReorderSliceAndReverse(
   return false;
 }
 
+absl::StatusOr<bool> AlgebraicSimplifierVisitor::RemoveRedundantStride(
+    absl::Nonnull<HloInstruction*> slice) {
+  CHECK(slice->opcode() == HloOpcode::kSlice);
+
+  std::vector<int64_t> index_to_change;
+  for (int64_t i = 0; i < slice->shape().rank(); ++i) {
+    const int64_t start = slice->slice_starts(i);
+    const int64_t stride = slice->slice_strides(i);
+    const int64_t limit = slice->slice_limits(i);
+
+    if (stride == 1) {
+      // Nothing to update.
+      continue;
+    }
+
+    if (stride >= limit || start + stride >= limit) {
+      index_to_change.push_back(i);
+    }
+  }
+
+  if (index_to_change.empty()) {
+    return false;
+  }
+
+  std::vector<int64_t> new_slice_limits = slice->slice_limits();
+  std::vector<int64_t> new_slice_strides = slice->slice_strides();
+  for (int64_t index : index_to_change) {
+    new_slice_limits[index] = slice->slice_starts(index) + 1;
+    new_slice_strides[index] = 1;
+  }
+
+  HloInstruction* slice_operand = slice->mutable_operand(0);
+  TF_RETURN_IF_ERROR(ReplaceWithNewInstruction(
+      slice, HloInstruction::CreateSlice(slice->shape(), slice_operand,
+                                         slice->slice_starts(),
+                                         new_slice_limits, new_slice_strides)));
+  return true;
+}
+
 absl::Status AlgebraicSimplifierVisitor::HandleSlice(HloInstruction* slice) {
   // Delete no-op slices, i.e. where shape = operand shape.
   if (ReplaceInstructionIfCompatible(slice, slice->mutable_operand(0))) {
@@ -7067,6 +7115,12 @@ absl::Status AlgebraicSimplifierVisitor::HandleSlice(HloInstruction* slice) {
     return absl::OkStatus();
   }
 
+  TF_ASSIGN_OR_RETURN(bool removed_redundant_stride,
+                      RemoveRedundantStride(slice));
+  if (removed_redundant_stride) {
+    VLOG(10) << "Removed redundant stride for slice op.";
+  }
+
   return absl::OkStatus();
 }
 
@@ -7396,16 +7450,30 @@ absl::Status AlgebraicSimplifierVisitor::HandleDynamicUpdateSlice(
       }
     }
 
-    const auto custom_call_pattern = m::CustomCall(
-        {host_memory_offload_annotations::kMoveToHostCustomCallTarget});
-    if (Match(dus_update,
-              m::AnyOf<HloInstruction>(m::Reshape(custom_call_pattern),
-                                       m::Bitcast(custom_call_pattern),
-                                       custom_call_pattern))) {
-      // If this dynamic-update-slice is used for host memory offloading, it
-      // should not be converted into a pad. Also allow for a reshape or a
-      // bitcast between the host-offloading custom-call and the
-      // dynamic-update-slice.
+    // For broadcast that's used for host offloading's DUS, we don't want this
+    // to be rewritten to a pad. Unfortunately, the host memory space is only
+    // set after HostOffloader is run, so we pattern match here. After
+    // HostOffloader is run the broadcast should be rewritten to an
+    // AllocateBuffer so this dus->pad rewrite won't apply anymore.
+    auto is_host_offloading = [&](HloInstruction* hlo) {
+      const auto custom_call_pattern = m::CustomCall(
+          {host_memory_offload_annotations::kMoveToHostCustomCallTarget});
+      if (Match(hlo, custom_call_pattern)) {
+        return true;
+      }
+
+      const auto formatting_op =
+          m::AnyOf<HloInstruction>(m::Reshape(), m::Bitcast(), m::Copy());
+      while (Match(hlo, formatting_op)) {
+        hlo = hlo->mutable_operand(0);
+        if (Match(hlo, custom_call_pattern)) {
+          return true;
+        }
+      }
+      return false;
+    };
+
+    if (compatible && is_host_offloading(dus_update)) {
       compatible = false;
     }
 
@@ -7419,23 +7487,23 @@ absl::Status AlgebraicSimplifierVisitor::HandleDynamicUpdateSlice(
           break;
         }
         VLOG(2) << "slice: " << slice_dim_start->ToString();
-        std::optional<int64_t> beg =
+        std::optional<int64_t> start =
             slice_dim_start->literal().GetFirstInteger();
-        if (!beg) {
+        if (!start) {
           compatible = false;
           break;
         }
-        VLOG(2) << "beg value: " << *beg;
+        VLOG(2) << "start value: " << *start;
         auto update_width = ShapeUtil::GetDimension(update_shape, dim);
         auto bcast_width = ShapeUtil::GetDimension(updated_shape, dim);
-        // Clamp beg so that it is non-negative.
-        *beg = std::max<int64_t>(0, *beg);
-        // Clamp beg so that it is in-bounds.
-        *beg = std::min<int64_t>(bcast_width - update_width, *beg);
-        VLOG(2) << "adjusted beg value: " << *beg;
-        padding_config_dim->set_edge_padding_low(*beg);
+        // Clamp start so that it is non-negative.
+        *start = std::max<int64_t>(0, *start);
+        // Clamp start so that it is in-bounds.
+        *start = std::min<int64_t>(bcast_width - update_width, *start);
+        VLOG(2) << "adjusted start value: " << *start;
+        padding_config_dim->set_edge_padding_low(*start);
         padding_config_dim->set_edge_padding_high(bcast_width -
-                                                  (*beg + update_width));
+                                                  (*start + update_width));
         // dynamic_update_slice does not specify a stride
         padding_config_dim->set_interior_padding(0);
       }
@@ -8214,6 +8282,24 @@ absl::Status AlgebraicSimplifierVisitor::HandleReduce(HloInstruction* hlo) {
     }
   }
 
+  return absl::OkStatus();
+}
+
+absl::Status AlgebraicSimplifierVisitor::HandleReducePrecision(
+    HloInstruction* hlo) {
+  HloReducePrecisionInstruction* reduce_precision =
+      Cast<HloReducePrecisionInstruction>(hlo);
+  PrimitiveType element_type =
+      reduce_precision->operand(0)->shape().element_type();
+  if (options_.enable_remove_no_op_reduce_precision() &&
+      reduce_precision->exponent_bits() ==
+          primitive_util::ExponentWidth(element_type) &&
+      reduce_precision->mantissa_bits() + 1 ==
+          primitive_util::SignificandWidth(element_type)) {
+    return ReplaceInstruction(
+        /*old_instruction=*/hlo,
+        /*new_instruction=*/reduce_precision->mutable_operand(0));
+  }
   return absl::OkStatus();
 }
 
@@ -9346,7 +9432,8 @@ absl::StatusOr<bool> AlgebraicSimplifierVisitor::SwapConvOperands(
   return true;
 }
 
-absl::StatusOr<bool> AlgebraicSimplifierVisitor::IsOneDnnRewritableBF16Conv(
+absl::StatusOr<bool>
+AlgebraicSimplifierVisitor::PromoteConvolutionToF32IfNotOnednnCompatible(
     HloInstruction** convolution) {
   bool can_rewrite = true;
   auto from_dtype = (*convolution)->shape().element_type();
@@ -9374,11 +9461,10 @@ absl::StatusOr<bool> AlgebraicSimplifierVisitor::IsOneDnnRewritableBF16Conv(
     can_rewrite = false;
   }
 
-  for (auto it = (*convolution)->window().dimensions().begin();
-       it != (*convolution)->window().dimensions().end(); it++) {
-    if ((*it).padding_low() < 0 || (*it).padding_high() < 0 ||
-        (*it).stride() < 0 || (*it).base_dilation() != 1 ||
-        (*it).window_reversal()) {
+  const auto& window_dims = (*convolution)->window().dimensions();
+  for (auto it = window_dims.begin(); it != window_dims.end(); ++it) {
+    if (it->padding_low() < 0 || it->padding_high() < 0 || it->stride() < 0 ||
+        it->base_dilation() != 1 || it->window_reversal()) {
       can_rewrite = false;
     }
   }
@@ -9680,15 +9766,18 @@ absl::Status AlgebraicSimplifierVisitor::HandleConvolution(
   if (swapped) {
     return absl::OkStatus();
   }
-#if defined(INTEL_MKL) && defined(ENABLE_ONEDNN_V3)
-  // Convert the data type back to F32 if we can't rewrite BF16 convolution to
-  // oneDNN custom call.
-  TF_ASSIGN_OR_RETURN(bool can_rewrite_bf16_conv_to_onednn,
-                      IsOneDnnRewritableBF16Conv(&convolution));
-  if (can_rewrite_bf16_conv_to_onednn) {
-    return absl::OkStatus();
+
+  if (options_.enable_onednn_support()) {
+    // Convert the data type back to F32 if we can't rewrite BF16 convolution to
+    // oneDNN custom call.
+    TF_ASSIGN_OR_RETURN(
+        bool can_rewrite_bf16_conv_to_onednn,
+        PromoteConvolutionToF32IfNotOnednnCompatible(&convolution));
+    if (can_rewrite_bf16_conv_to_onednn) {
+      return absl::OkStatus();
+    }
   }
-#endif  // INTEL_MKL && ENABLE_ONEDNN_V3
+
   // Try to replace the convolution with a kDot or a kMultiply instruction.
   TF_ASSIGN_OR_RETURN(bool replaced_with_dot, SimplifyConvToDot(convolution));
   if (replaced_with_dot) {

@@ -17,6 +17,7 @@ limitations under the License.
 
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <map>
 #include <optional>
@@ -55,10 +56,6 @@ struct JsonTraceOptions {
 
   // Options and values for filtering based on the "details" menu.
   Details details;
-
-  // If selected_device_ids is set, we add a field "selected_device_ids"
-  // in the Trace JSON.
-  std::optional<absl::flat_hash_set<uint32_t>> selected_device_ids;
 
   // Device IDs of devices whose resources should be sorted by name instead of
   // by resource ID.
@@ -470,21 +467,6 @@ void WriteDetails(const JsonTraceOptions::Details& details, IOBuffer* output) {
   output->Append("],");
 }
 
-template <typename IOBuffer>
-void WriteSelectedDeviceIds(
-    const absl::optional<absl::flat_hash_set<uint32_t>>& selected_device_ids,
-    IOBuffer* output) {
-  if (!selected_device_ids.has_value()) return;
-
-  output->Append(R"("selected_device_ids":[)");
-  JsonSeparator<IOBuffer> separator(output);
-  for (const auto& device_id : selected_device_ids.value()) {
-    separator.Add();
-    output->Append(device_id);
-  }
-  output->Append("],");
-}
-
 std::map<uint64_t, uint64_t> BuildStackFrameReferences(const Trace& trace);
 
 template <typename IOBuffer>
@@ -522,7 +504,6 @@ void TraceEventsToJson(const JsonTraceOptions& options,
   output->Append(absl::StrFormat(R"("useNewBackend": %s,)",
                                  options.use_new_backend ? "true" : "false"));
   WriteDetails(options.details, output);
-  WriteSelectedDeviceIds(options.selected_device_ids, output);
   WriteReturnedEventsSize(events.NumEvents(), output);
   WriteFilteredByVisibility(events.FilterByVisibility(), output);
   WriteTraceFullTimespan(&events.trace(), output);

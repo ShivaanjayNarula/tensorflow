@@ -128,7 +128,7 @@ message TraceEvent {
   enum EventType {
     EVENT_TYPE_UNSPECIFIED = 0;
     EVENT_TYPE_COMPLETE = 1;
-    EVENT_TYPE_FLOW = 2;
+    EVENT_TYPE_FLOW = 2;  // DEPRECATED.
     EVENT_TYPE_ASYNC = 3;
     EVENT_TYPE_COUNTER = 4;
   }

@@ -23,9 +23,12 @@ limitations under the License.
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
+#include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_split.h"
+#include "xla/tsl/platform/status.h"
 #include "tensorflow/core/platform/env.h"
+#include "tensorflow/core/platform/file_system.h"
 #include "tensorflow/core/platform/test.h"
 #include "tensorflow/core/profiler/convert/repository.h"
 #include "tensorflow/core/profiler/utils/xplane_schema.h"
@@ -113,14 +116,18 @@ TEST_P(XPlaneToToolsTest, ToolsList) {
 
   std::vector<std::string> tools = absl::StrSplit(toolsString.value(), ',');
 
-  std::vector<std::string> expected_tools = {"trace_viewer",
-                                             "overview_page",
-                                             "input_pipeline_analyzer",
-                                             "framework_op_stats",
-                                             "memory_profile",
-                                             "pod_viewer",
-                                             "tf_data_bottleneck_analysis",
-                                             "op_profile"};
+  std::vector<std::string> expected_tools = {
+      "trace_viewer",
+      "overview_page",
+      "input_pipeline_analyzer",
+      "framework_op_stats",
+      "memory_profile",
+      "pod_viewer",
+      "op_profile",
+      "hlo_stats",
+      "roofline_model",
+      "inference_profile",
+  };
   expected_tools.insert(expected_tools.end(), test_case.expected_tools.begin(),
                         test_case.expected_tools.end());
   EXPECT_THAT(tools, ::testing::UnorderedElementsAreArray(expected_tools));

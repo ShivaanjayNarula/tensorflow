@@ -18,6 +18,7 @@ limitations under the License.
 #include <cstdint>
 
 #include "absl/strings/str_split.h"
+#include "absl/strings/string_view.h"
 #include "tensorflow/core/profiler/utils/xplane_schema.h"
 #include "tensorflow/core/profiler/utils/xplane_visitor.h"
 
@@ -72,6 +73,9 @@ GpuEventStats::GpuEventStats(const XEventVisitor* event) {
         break;
       case StatType::kCudaGraphId:
         cuda_graph_id_for_inner_node = stat.UintValue();
+        break;
+      case StatType::kScopeRangeId:
+        scope_range_id = stat.IntValue();
         break;
       default:
         break;

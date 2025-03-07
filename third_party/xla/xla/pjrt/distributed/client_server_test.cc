@@ -18,7 +18,6 @@ limitations under the License.
 #include <memory>
 #include <optional>
 #include <string>
-#include <string_view>
 #include <vector>
 
 #include "absl/log/log.h"
@@ -46,6 +45,7 @@ limitations under the License.
 #include "xla/status_macros.h"
 #include "xla/tsl/distributed_runtime/coordination/coordination_service_agent.h"
 #include "xla/tsl/lib/core/status_test_util.h"
+#include "xla/tsl/platform/threadpool.h"
 #include "tsl/platform/env.h"
 #include "tsl/platform/errors.h"
 #include "tsl/platform/statusor.h"
@@ -985,6 +985,46 @@ TEST_F(ClientServerTest,
   }
 }
 
+TEST_F(ClientServerTest, GetLiveTasksSucceeds) {
+  const int num_nodes = 3;
+  StartService(num_nodes);
+
+  tsl::thread::ThreadPool tp(tsl::Env::Default(), "test_threads", num_nodes);
+  for (int i = 0; i < num_nodes; ++i) {
+    tp.Schedule([&, i]() {
+      // Connect the client, which acts as a barrier.
+      std::shared_ptr<DistributedRuntimeClient> client = GetClient(i);
+      TF_ASSERT_OK(client->Connect());
+
+      // Get the set of live nodes. All three nodes should be live.
+      absl::StatusOr<std::vector<int32_t>> live_nodes =
+          client->GetLiveNodes(std::vector<int>{0, 1, 2});
+      TF_ASSERT_OK(live_nodes.status());
+      EXPECT_THAT(*live_nodes, UnorderedElementsAre(0, 1, 2));
+    });
+  }
+}
+
+TEST_F(ClientServerTest, GetLiveTasksWithoutBeingAMember) {
+  const int num_nodes = 3;
+  StartService(num_nodes);
+
+  tsl::thread::ThreadPool tp(tsl::Env::Default(), "test_threads", num_nodes);
+  for (int i = 0; i < num_nodes; ++i) {
+    tp.Schedule([&, i]() {
+      // Connect the client, which acts as a barrier.
+      std::shared_ptr<DistributedRuntimeClient> client = GetClient(i);
+      TF_ASSERT_OK(client->Connect());
+
+      // Get the set of live nodes but don't include ourselves.
+      std::vector<int> nodes{0, 1, 2};
+      nodes.erase(nodes.begin() + i);
+      EXPECT_THAT(client->GetLiveNodes(nodes),
+                  StatusIs(absl::StatusCode::kInvalidArgument));
+    });
+  }
+}
+
 TEST_F(ClientServerTest, KeyValueDirGet) {
   StartService(/*num_nodes=*/1);
   auto client = GetClient(/*node_id=*/0);
@@ -1028,6 +1068,20 @@ TEST_F(ClientServerTest, KeyValueSet_Duplicate_Overwrites) {
       client->BlockingKeyValueGet("test_key", absl::Milliseconds(100));
   TF_ASSERT_OK(result.status());
   EXPECT_EQ(result.value(), "overwritten_value");
+}
+
+TEST_F(ClientServerTest, KeyValueTryGet) {
+  StartService(/*num_nodes=*/1);
+  auto client = GetClient(/*node_id=*/0);
+  TF_ASSERT_OK(client->Connect());
+
+  ASSERT_THAT(client->KeyValueTryGet("test_key").status(),
+              StatusIs(absl::StatusCode::kNotFound));
+
+  TF_ASSERT_OK(client->KeyValueSet("test_key", "value"));
+  auto result = client->KeyValueTryGet("test_key");
+  TF_ASSERT_OK(result.status());
+  EXPECT_EQ(result.value(), "value");
 }
 
 TEST_F(ClientServerTest, KeyValueDelete) {

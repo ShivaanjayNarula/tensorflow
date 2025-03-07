@@ -180,11 +180,6 @@ class HasRankAtLeast<int n> : Constraint<
     CPred<"$0.getType().cast<ShapedType>().hasRank() && "
           "$0.getType().cast<ShapedType>().getRank() >= " # n>>;
 
-// Checks value is not produced by a TFL_Quant or
-// from TFL_Quant Op with same quant type.
-def NotFromQuantOpOrSameQuantType : Constraint<
-  CPred<"tflite::NotFromQuantOpOrSameQuantType($0,$1)">>;
-
 // Accepts two inputs and check if both have the same element type.
 def SameElementType : Constraint<
   CPred<"getElementTypeOrSelf($0) == getElementTypeOrSelf($1)">>;
@@ -219,3 +214,8 @@ def IsNoneType : Constraint<CPred<"$0.getType().isa<NoneType>()">>;
 def ConstantLikePred : CPred<"::mlir::matchPattern($0, ::mlir::m_Constant())">;
 def IsConstantLike : Constraint<ConstantLikePred>;
 def NotConstantLike : Constraint<Neg<ConstantLikePred>>;
+
+// Here, the element type can be any integer or float type. But, note that only
+// 32 bit integers are supported for the values.
+class GetScalarOfType<int value> : NativeCodeCall<
+  "GetScalarOfType(getElementTypeOrSelf($0)," # value # ")">;
